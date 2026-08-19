@@ -1,0 +1,145 @@
+import copy
+import json
+import sys
+import tempfile
+import unittest
+import zipfile
+from pathlib import Path
+from xml.etree import ElementTree
+
+from docx import Document
+
+
+SCRIPTS = Path(__file__).resolve().parents[1] / "skills/book-translator/scripts"
+sys.path.insert(0, str(SCRIPTS))
+import documents
+
+
+W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+R = "http://schemas.openxmlformats.org/package/2006/relationships"
+CT = "http://schemas.openxmlformats.org/package/2006/content-types"
+
+
+def make_docx(path: Path) -> None:
+    document = Document()
+    document.add_heading("Chapter One", level=1)
+    paragraph = document.add_paragraph()
+    paragraph.add_run("Quiet ")
+    italic = paragraph.add_run("thought")
+    italic.italic = True
+    bold = paragraph.add_run(" became an order.")
+    bold.bold = True
+    scene = document.add_paragraph("* * *")
+    scene.style = document.styles["Normal"]
+    document.add_paragraph("After the break.")
+    document.save(path)
+
+
+def add_footnote(path: Path) -> None:
+    with zipfile.ZipFile(path) as archive:
+        contents = {name: archive.read(name) for name in archive.namelist()}
+
+    document = ElementTree.fromstring(contents["word/document.xml"])
+    paragraphs = document.findall(f".//{{{W}}}p")
+    reference_run = ElementTree.Element(f"{{{W}}}r")
+    ElementTree.SubElement(reference_run, f"{{{W}}}footnoteReference", {f"{{{W}}}id": "7"})
+    paragraphs[1].append(reference_run)
+    contents["word/document.xml"] = ElementTree.tostring(document, encoding="utf-8", xml_declaration=True)
+
+    relationships = ElementTree.fromstring(contents["word/_rels/document.xml.rels"])
+    ElementTree.SubElement(
+        relationships,
+        f"{{{R}}}Relationship",
+        {"Id": "rIdFootnotes", "Type": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes", "Target": "footnotes.xml"},
+    )
+    contents["word/_rels/document.xml.rels"] = ElementTree.tostring(relationships, encoding="utf-8", xml_declaration=True)
+
+    content_types = ElementTree.fromstring(contents["[Content_Types].xml"])
+    ElementTree.SubElement(
+        content_types,
+        f"{{{CT}}}Override",
+        {"PartName": "/word/footnotes.xml", "ContentType": "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"},
+    )
+    contents["[Content_Types].xml"] = ElementTree.tostring(content_types, encoding="utf-8", xml_declaration=True)
+
+    footnotes = ElementTree.Element(f"{{{W}}}footnotes")
+    for identifier in ("-1", "0"):
+        ElementTree.SubElement(footnotes, f"{{{W}}}footnote", {f"{{{W}}}id": identifier})
+    footnote = ElementTree.SubElement(footnotes, f"{{{W}}}footnote", {f"{{{W}}}id": "7"})
+    paragraph = ElementTree.SubElement(footnote, f"{{{W}}}p")
+    run = ElementTree.SubElement(paragraph, f"{{{W}}}r")
+    ElementTree.SubElement(run, f"{{{W}}}t").text = "A note."
+    contents["word/footnotes.xml"] = ElementTree.tostring(footnotes, encoding="utf-8", xml_declaration=True)
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, content in contents.items():
+            archive.writestr(name, content)
+
+
+def block(identifier: str, text: str, *, footnote: str | None = None) -> dict:
+    return {
+        "идентификатор": identifier,
+        "тип": "сноска" if identifier.startswith("F") else "абзац",
+        "стиль": "Normal",
+        "фрагменты": [{"текст": text, "курсив": False, "полужирный": False, "сноска": footnote}],
+    }
+
+
+class DocxBlockTests(unittest.TestCase):
+    def test_extracts_stable_blocks_formatting_and_referenced_footnote(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "chapter.docx"
+            target = root / "blocks.json"
+            make_docx(source)
+            add_footnote(source)
+
+            blocks = documents.extract_docx(source, target)
+
+            self.assertEqual(
+                ["B000001", "B000002", "F7-P1", "B000003", "B000004"],
+                [block["идентификатор"] for block in blocks],
+            )
+            self.assertEqual("заголовок", blocks[0]["тип"])
+            self.assertTrue(blocks[1]["фрагменты"][1]["курсив"])
+            self.assertTrue(blocks[1]["фрагменты"][2]["полужирный"])
+            self.assertEqual("7", blocks[1]["фрагменты"][-1]["сноска"])
+            self.assertEqual("сноска", blocks[2]["тип"])
+            self.assertEqual("A note.", blocks[2]["фрагменты"][0]["текст"])
+            self.assertEqual(blocks, documents.load_blocks(target))
+            self.assertIn("заголовок", target.read_text(encoding="utf-8"))
+
+    def test_rejects_missing_empty_duplicate_reordered_unknown_and_reformatted_blocks(self):
+        source = [block("B000001", "One"), block("B000002", "Two")]
+        variants = {
+            "отсутствует": source[:1],
+            "пуст": [{**source[0], "фрагменты": [{**source[0]["фрагменты"][0], "текст": ""}]}, source[1]],
+            "повтор": [source[0], source[0], source[1]],
+            "поряд": list(reversed(source)),
+            "неизвест": source + [block("B999999", "Three")],
+            "оформлен": [{**source[0], "фрагменты": [{**source[0]["фрагменты"][0], "курсив": True}]}, source[1]],
+        }
+        for word, translated in variants.items():
+            with self.subTest(word=word):
+                self.assertTrue(
+                    any(word in error.lower() for error in documents.validate_translation(source, copy.deepcopy(translated)))
+                )
+
+    def test_split_blocks_preserves_order_without_splitting_footnote_from_reference(self):
+        blocks = [
+            block("B000001", "x" * 20, footnote="7"),
+            block("F7-P1", "x" * 20),
+            block("B000002", "x" * 20),
+            block("B000003", "x" * 20),
+            block("B000004", "x" * 20),
+        ]
+
+        chunks = documents.split_blocks(blocks, max_chars=45)
+
+        self.assertEqual([block["идентификатор"] for block in blocks], [block["идентификатор"] for chunk in chunks for block in chunk])
+        self.assertEqual([2, 2, 1], [len(chunk) for chunk in chunks])
+        self.assertEqual(["B000001", "F7-P1"], [block["идентификатор"] for block in chunks[0]])
+
+
+if __name__ == "__main__":
+    unittest.main()
