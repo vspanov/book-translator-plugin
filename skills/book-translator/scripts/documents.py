@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
+import platform
 import re
+import subprocess
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
@@ -23,6 +27,66 @@ UNSUPPORTED_XML = {
     "del": "Документ содержит отслеживаемые удаления.",
     "txbxContent": "Документ содержит связанные текстовые блоки.",
 }
+
+
+def preflight_formats(
+    input_suffixes: set[str], output_format: str, system: str, pages_available: bool
+) -> list[str]:
+    wants_pages = ".pages" in {suffix.casefold() for suffix in input_suffixes} or output_format.casefold().lstrip(".") == "pages"
+    if system == "Windows" and wants_pages:
+        return ["Windows не поддерживает Pages: используйте Mac с Pages или сохраните документ как DOCX."]
+    if system == "Darwin" and wants_pages and not pages_available:
+        return ["Приложение Pages не найдено на этом Mac."]
+    if system not in {"Windows", "Darwin"}:
+        return [f"Операционная система {system} не поддерживается первой версией плагина."]
+    return []
+
+
+def preflight_python(version: tuple[int, int, int]) -> list[str]:
+    if version < (3, 10, 0):
+        return [f"Python {version[0]}.{version[1]} не поддерживается; требуется Python 3.10 или новее."]
+    return []
+
+
+def preflight_dependency(version: str | None) -> list[str]:
+    if version is None:
+        return ["Пакет python-docx не найден. Покажите команду установки и запросите разрешение пользователя."]
+    match = re.match(r"^(\d+)\.(\d+)", version)
+    if match is None or int(match.group(1)) != 1 or int(match.group(2)) < 2:
+        return [f"Версия python-docx {version} не поддерживается; требуется 1.2 или новее, но ниже 2.0."]
+    return []
+
+
+def runtime_report() -> dict[str, str | None]:
+    try:
+        dependency_version = importlib.metadata.version("python-docx")
+    except importlib.metadata.PackageNotFoundError:
+        dependency_version = None
+    return {
+        "python": sys.executable,
+        "python_version": platform.python_version(),
+        "python_docx": dependency_version,
+    }
+
+
+def run_pages_bridge(mode: str, source: Path, destination: Path, allowed: bool) -> None:
+    if not allowed:
+        raise PermissionError("Для запуска Pages требуется явное разрешение пользователя.")
+    if mode not in {"export", "import"}:
+        raise ValueError("Направление Pages должно быть export или import.")
+    script = Path(__file__).with_name("pages-bridge.applescript")
+    try:
+        completed = subprocess.run(
+            ["osascript", str(script), mode, str(source.resolve()), str(destination.resolve())],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as error:
+        raise RuntimeError(f"Не удалось запустить Pages: {error}") from error
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "неизвестная ошибка"
+        raise RuntimeError(f"Pages не смог обработать документ: {detail}")
 
 
 def natural_key(path: Path) -> tuple:
