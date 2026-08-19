@@ -30,6 +30,10 @@ def make_directory_link(link: Path, target: Path) -> None:
         link.symlink_to(target, target_is_directory=True)
 
 
+def remove_directory_link(link: Path) -> None:
+    link.unlink() if link.is_symlink() else link.rmdir()
+
+
 def make_state_directory(path: Path, prefix: str = "new") -> Path:
     path.mkdir(parents=True, exist_ok=True)
     for name in progress.STATE_ASSETS:
@@ -55,7 +59,10 @@ class ProjectInitializationTests(unittest.TestCase):
             progress.initialize_project(project)
             self.assertTrue((project / "output").is_dir())
             self.assertTrue((project / "work").is_dir())
-            self.assertIn("Персонажи", (project / "state/characters.md").read_text(encoding="utf-8"))
+            self.assertIn(
+                "Персонажи",
+                (project / "state/characters.md").read_text(encoding="utf-8"),
+            )
             state = json.loads((project / "progress.json").read_text(encoding="utf-8"))
             self.assertEqual("не_начат", state["статус_книги"])
             self.assertIsNone(state["текущая_глава"])
@@ -68,6 +75,17 @@ class ProjectInitializationTests(unittest.TestCase):
             existing.write_text("МОЙ ВАРИАНТ", encoding="utf-8")
             progress.initialize_project(project)
             self.assertEqual("МОЙ ВАРИАНТ", existing.read_text(encoding="utf-8"))
+
+    def test_atomic_json_ignores_predictable_hardlink_temporary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            progress.initialize_project(project)
+            original = make_file(project / "input/original.json", b"original")
+            os.link(original, project / "progress.json.tmp")
+
+            progress.write_json_atomic(project / "progress.json", {"версия": 1})
+
+            self.assertEqual(b"original", original.read_bytes())
 
 
 class StageMachineTests(unittest.TestCase):
@@ -120,6 +138,43 @@ class StageMachineTests(unittest.TestCase):
             self.assertEqual(str(project.resolve()), active["проект"])
             self.assertEqual("chapter-1.docx", active["глава"])
             self.assertIn("время_начала", active)
+
+    def test_missing_active_marker_does_not_allow_overwriting_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            progress.initialize_project(project)
+            progress.start_chapter(project, "chapter-1.docx")
+            (project / "work/active.json").unlink()
+
+            with self.assertRaisesRegex(ValueError, "незаверш"):
+                progress.start_chapter(project, "chapter-2.docx")
+
+            self.assertEqual("chapter-1.docx", progress.load_progress(project)["текущая_глава"])
+
+    def test_recorded_error_does_not_allow_starting_next_chapter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            progress.initialize_project(project)
+            progress.start_chapter(project, "chapter-1.docx")
+            state = progress.load_progress(project)
+            state.update({"статус_книги": "ошибка", "этап": "готово", "ошибка": "Сбой"})
+            progress.write_json_atomic(project / "progress.json", state)
+
+            with self.assertRaisesRegex(ValueError, "ошиб"):
+                progress.start_chapter(project, "chapter-2.docx")
+
+            self.assertEqual("chapter-1.docx", progress.load_progress(project)["текущая_глава"])
+
+    def test_dot_chapter_names_are_rejected(self):
+        for chapter_name in (".", ".."):
+            with (
+                self.subTest(chapter_name=chapter_name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                project = Path(directory)
+                progress.initialize_project(project)
+                with self.assertRaisesRegex(ValueError, "Имя главы"):
+                    progress.start_chapter(project, chapter_name)
 
     def test_second_edit_is_optional_and_third_cycle_is_forbidden(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -209,11 +264,87 @@ class TransactionTests(unittest.TestCase):
                 self.assertFalse((source / "transactions").exists())
             finally:
                 if linked.exists():
-                    linked.rmdir()
+                    remove_directory_link(linked)
+
+    def test_prepare_rejects_transactions_link_to_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            progress.initialize_project(project)
+            source = project / "input"
+            sentinel = make_file(source / "original.docx", b"original")
+            linked = project / "work/transactions"
+            make_directory_link(linked, source)
+            try:
+                with self.assertRaisesRegex(ValueError, "transactions.*небезопас"):
+                    self.prepare(project)
+                self.assertEqual(b"original", sentinel.read_bytes())
+                self.assertEqual(["original.docx"], [path.name for path in source.iterdir()])
+            finally:
+                if linked.exists():
+                    remove_directory_link(linked)
+
+    def test_recovery_rejects_transaction_link_to_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            progress.initialize_project(project)
+            transactions = project / "work/transactions"
+            transactions.mkdir()
+            source = project / "input"
+            sentinel = make_file(source / "original.docx", b"original")
+            linked = transactions / "danger"
+            make_directory_link(linked, source)
+            try:
+                with self.assertRaisesRegex(ValueError, "транзакц.*небезопас"):
+                    progress.recover_transaction(project)
+                self.assertEqual(b"original", sentinel.read_bytes())
+            finally:
+                if linked.exists():
+                    remove_directory_link(linked)
+
+    def test_prepare_rejects_incomplete_next_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            progress.initialize_project(project)
+            checkpoint = ready_progress("chapter-1.docx")
+            del checkpoint["версия"]
+
+            with self.assertRaisesRegex(ValueError, "контрольн.*неполн"):
+                progress.prepare_transaction(
+                    project,
+                    chapter_name="chapter-1.docx",
+                    built_document=make_file(project / "work/result.docx", b"result"),
+                    next_state=make_state_directory(project / "work/next-state"),
+                    next_progress=checkpoint,
+                )
+
+    def test_tampered_next_progress_after_interrupt_rolls_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            progress.initialize_project(project)
+            old_progress = (project / "progress.json").read_bytes()
+            old_memory = progress.directory_sha256(project / "state")
+            original = make_file(project / "input/original.json", b"original")
+            os.link(original, project / "progress.json.rollback.tmp")
+            transaction = self.prepare(project)
+            progress.commit_transaction(project, transaction, interrupt_after="state")
+            tampered = ready_progress("chapter-1.docx")
+            tampered["подмена"] = True
+            progress.write_json_atomic(transaction / "next-progress.json", tampered)
+
+            with self.assertRaisesRegex(ValueError, "восстанов"):
+                progress.recover_transaction(project)
+
+            self.assertEqual(old_progress, (project / "progress.json").read_bytes())
+            self.assertEqual(old_memory, progress.directory_sha256(project / "state"))
+            self.assertFalse((transaction / "завершено").exists())
+            self.assertEqual(b"original", original.read_bytes())
 
     def test_recovery_finishes_interruptions_without_retranslation(self):
         for interrupted_step in ("state", "output"):
-            with self.subTest(interrupted_step=interrupted_step), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(interrupted_step=interrupted_step),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 project = Path(directory)
                 progress.initialize_project(project)
                 transaction = self.prepare(project)
@@ -222,7 +353,10 @@ class TransactionTests(unittest.TestCase):
                 progress.recover_transaction(project)
 
                 self.assertEqual(b"result", (project / "output/chapter-1.docx").read_bytes())
-                self.assertEqual("chapter-1.docx", progress.load_progress(project)["последняя_готовая_глава"])
+                self.assertEqual(
+                    "chapter-1.docx",
+                    progress.load_progress(project)["последняя_готовая_глава"],
+                )
                 self.assertTrue((transaction / "завершено").is_file())
                 self.assertEqual([], progress.check_consistency(project))
 
@@ -271,8 +405,76 @@ class TransactionTests(unittest.TestCase):
             self.assertTrue(any("результат" in error for error in errors))
             self.assertTrue(any("памят" in error for error in errors))
 
+    def test_consistency_rejects_truncated_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            progress.initialize_project(project)
+            progress.write_json_atomic(project / "progress.json", {"версия": 1})
+
+            errors = progress.check_consistency(project)
+
+            self.assertTrue(any("progress" in error or "контроль" in error for error in errors))
+
+    def test_consistency_rejects_output_link_outside_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            progress.initialize_project(project)
+            transaction = self.prepare(project)
+            progress.commit_transaction(project, transaction)
+            result = (project / "output/chapter-1.docx").read_bytes()
+            (project / "output/chapter-1.docx").unlink()
+            (project / "output").rmdir()
+            external = base / "external-output"
+            make_file(external / "chapter-1.docx", result)
+            linked = project / "output"
+            make_directory_link(linked, external)
+            try:
+                errors = progress.check_consistency(project)
+                self.assertTrue(any("небезопас" in error or "ссыл" in error for error in errors))
+            finally:
+                remove_directory_link(linked)
+
 
 class FinishAndRestartTests(unittest.TestCase):
+    def test_finish_rejects_recorded_error_and_keeps_active_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            progress.initialize_project(project)
+            progress.start_chapter(project, "chapter-1.docx")
+            state = progress.load_progress(project)
+            state.update({"статус_книги": "ошибка", "этап": "готово", "ошибка": "Сбой"})
+            progress.write_json_atomic(project / "progress.json", state)
+
+            with self.assertRaisesRegex(ValueError, "ошиб"):
+                progress.finish_book(project)
+
+            self.assertTrue((project / "work/active.json").exists())
+
+    def test_finish_requires_every_manifest_chapter_to_be_published(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            progress.initialize_project(project)
+            progress.start_chapter(project, "chapter-2.docx")
+            progress.write_json_atomic(
+                project / "work/manifest.json",
+                {"версия": 1, "главы": [{"имя": "chapter-1.docx"}, {"имя": "chapter-2.docx"}]},
+            )
+            transaction = progress.prepare_transaction(
+                project,
+                chapter_name="chapter-2.docx",
+                built_document=make_file(project / "work/result.docx", b"result-2"),
+                next_state=make_state_directory(project / "work/next-state"),
+                next_progress=ready_progress("chapter-2.docx"),
+            )
+            progress.commit_transaction(project, transaction)
+
+            with self.assertRaisesRegex(ValueError, "chapter-1"):
+                progress.finish_book(project)
+
+            self.assertTrue((project / "work/active.json").exists())
+
     def test_finish_requires_no_unprocessed_chapters_and_removes_active_marker(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
@@ -358,7 +560,7 @@ class FinishAndRestartTests(unittest.TestCase):
                 self.assertEqual(b"original", original.read_bytes())
             finally:
                 if linked.exists():
-                    linked.rmdir()
+                    remove_directory_link(linked)
 
 
 if __name__ == "__main__":
