@@ -138,35 +138,97 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("только после успешной фиксации", self.lower)
 
     def test_start_tasks_use_absolute_inputs_and_exactly_one_output(self):
-        sections = dict(re.findall(
-            r"### Шаблон: ([^\n]+)\n(.*?)(?=\n### Шаблон:|\n## Самопроверка координатора)",
+        section_matches = re.findall(
+            r"(?ms)^### Шаблон: ([^\n]+)\n(.*?)(?=^### Шаблон: |^## Самопроверка координатора)",
             self.text,
-            flags=re.DOTALL,
-        ))
-        expected_agents = {
-            "translator": "book_translator_translator",
-            "verifier 1": "book_translator_verifier",
-            "editor 1": "book_translator_editor",
-            "verifier 2": "book_translator_verifier",
-            "editor 2": "book_translator_editor",
-            "verifier 3": "book_translator_verifier",
-            "state-updater": "book_translator_state_updater",
+        )
+        expected = {
+            "translator": {
+                "agent": "book_translator_translator",
+                "inputs": ("translation-principles.md", "source-blocks.json", "chunks-manifest.json", "{project}/state/"),
+                "input_lines": 3,
+                "output": "{chapter_work}/draft.json",
+                "forbidden": ("report-", "edited-", "accepted.json", "{final_translation}"),
+            },
+            "verifier 1": {
+                "agent": "book_translator_verifier",
+                "inputs": ("verification-rules.md", "source-blocks.json", "draft.json", "{project}/state/"),
+                "input_lines": 4,
+                "output": "{chapter_work}/report-1.json",
+                "forbidden": ("report-", "edited-", "accepted.json", "{final_translation}"),
+            },
+            "editor 1": {
+                "agent": "book_translator_editor",
+                "inputs": ("translation-principles.md", "source-blocks.json", "draft.json", "report-1.json", "{project}/state/"),
+                "input_lines": 5,
+                "output": "{chapter_work}/edited-1.json",
+                "forbidden": ("report-2.json", "report-3.json", "edited-", "accepted.json", "{final_translation}"),
+            },
+            "verifier 2": {
+                "agent": "book_translator_verifier",
+                "inputs": ("verification-rules.md", "source-blocks.json", "edited-1.json", "{project}/state/"),
+                "input_lines": 4,
+                "output": "{chapter_work}/report-2.json",
+                "forbidden": ("report-", "draft.json", "edited-2.json", "accepted.json", "{final_translation}"),
+            },
+            "editor 2": {
+                "agent": "book_translator_editor",
+                "inputs": ("translation-principles.md", "source-blocks.json", "edited-1.json", "report-2.json", "{project}/state/"),
+                "input_lines": 5,
+                "output": "{chapter_work}/edited-2.json",
+                "forbidden": ("report-1.json", "report-3.json", "draft.json", "accepted.json", "{final_translation}"),
+            },
+            "verifier 3": {
+                "agent": "book_translator_verifier",
+                "inputs": ("verification-rules.md", "source-blocks.json", "edited-2.json", "{project}/state/"),
+                "input_lines": 4,
+                "output": "{chapter_work}/report-3.json",
+                "forbidden": ("report-", "draft.json", "edited-1.json", "accepted.json", "{final_translation}"),
+            },
+            "state-updater": {
+                "agent": "book_translator_state_updater",
+                "inputs": ("source-blocks.json", "{final_translation}", "{project}/state/"),
+                "input_lines": 3,
+                "output": "{transaction}/new-state/",
+                "forbidden": ("report-", "draft.json", "edited-", "accepted.json"),
+            },
         }
-        self.assertEqual(set(expected_agents), set(sections))
-        templates = []
-        for heading, agent_name in expected_agents.items():
+        headings = [heading for heading, _ in section_matches]
+        self.assertEqual(7, len(section_matches))
+        self.assertEqual(set(expected), set(headings))
+        for heading in expected:
+            self.assertEqual(1, headings.count(heading), heading)
+
+        for heading, section in section_matches:
             with self.subTest(template=heading):
-                section = sections[heading]
-                template = re.search(r"```text\n(.*?)\n```", section, flags=re.DOTALL).group(1)
-                templates.append(template)
-                self.assertIn(f"Custom agent: {agent_name}", section)
-                self.assertIn('Параметр изоляции запуска: fork_turns="none".', section)
-                self.assertIn("ноль turns/истории родителя", section)
-                self.assertIn("Абсолютный путь", template)
-                self.assertEqual(1, template.count("Единственный output:"))
+                contract = expected[heading]
+                blocks = re.findall(r"```text\n(.*?)\n```", section, flags=re.DOTALL)
+                self.assertEqual(1, len(blocks))
+                template = blocks[0]
+                prelude = section.split("```text", 1)[0]
+                input_lines = [line for line in template.splitlines() if line.startswith("Абсолютный путь")]
+                output_lines = [line for line in template.splitlines() if line.startswith("Единственный output:")]
+                inputs = "\n".join(input_lines)
+
+                self.assertIn(f"Custom agent: {contract['agent']}", prelude)
+                self.assertIn('Параметр изоляции запуска: fork_turns="none".', prelude)
+                self.assertIn("Стартовое сообщение — только заполненный шаблон ниже", prelude)
+                for phrase in ("роль", "абсолютные пути входов", "ровно один абсолютный путь output", "финальная инструкция"):
+                    self.assertIn(phrase, prelude.casefold())
+                self.assertNotIn("только приведённые ниже абсолютные пути", prelude.casefold())
+
+                self.assertEqual(contract["input_lines"], len(input_lines))
+                for token in contract["inputs"]:
+                    self.assertIn(token, inputs)
+                if heading == "translator":
+                    self.assertIn("либо", inputs)
+                for token in contract["forbidden"]:
+                    self.assertNotIn(token, inputs)
+                for token in ("turns", "истори", "стенограмм", "рассужден", "свободн"):
+                    self.assertNotIn(token, template.casefold())
+
+                self.assertEqual([f"Единственный output: {contract['output']}"], output_lines)
                 self.assertTrue(template.endswith("Не используй сведения вне перечисленных файлов."))
-        self.assertNotIn("report-1.json", templates[3])
-        self.assertNotIn("report-1.json", templates[5])
 
 
 class UniversalReferenceTests(unittest.TestCase):
