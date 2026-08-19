@@ -24,7 +24,7 @@ def _rewrite_zip(path: Path, replacements: dict[str, bytes]) -> None:
     temporary_path.replace(path)
 
 
-def make_formatted_docx(path: Path) -> None:
+def make_formatted_docx(path: Path, *, footnote_in_text_run: bool = False) -> None:
     document = Document()
     document.add_heading("Chapter One", level=1)
     paragraph = document.add_paragraph()
@@ -51,7 +51,11 @@ def make_formatted_docx(path: Path) -> None:
         })
         body = ET.fromstring(package.read("word/document.xml"))
     paragraph_xml = body.findall(f".//{{{W}}}p")[-1]
-    run = ET.SubElement(paragraph_xml, f"{{{W}}}r")
+    run = (
+        paragraph_xml.findall(f"./{{{W}}}r")[-1]
+        if footnote_in_text_run
+        else ET.SubElement(paragraph_xml, f"{{{W}}}r")
+    )
     ET.SubElement(run, f"{{{W}}}footnoteReference", {f"{{{W}}}id": "2"})
     footnotes = ET.fromstring(
         f'<w:footnotes xmlns:w="{W}"><w:footnote w:id="-1"/>'

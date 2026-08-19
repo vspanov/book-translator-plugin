@@ -8,7 +8,8 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 from docx import Document
-from tests.docx_fixture import make_formatted_docx
+from tests.docx_fixture import W as FIXTURE_W
+from tests.docx_fixture import _rewrite_zip, make_formatted_docx
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills/book-translator/scripts"
@@ -174,6 +175,25 @@ class DocxBlockTests(unittest.TestCase):
 
 
 class DocxRoundTripTests(unittest.TestCase):
+    def test_rebuild_rejects_missing_or_reordered_footnote_block_before_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.docx"
+            blocks_path = root / "blocks.json"
+            make_formatted_docx(source)
+            blocks = documents.extract_docx(source, blocks_path)
+            variants = {
+                "отсутствующая": [block for block in blocks if block["тип"] != "сноска"],
+                "переставленная": [blocks[0], blocks[1], blocks[3], blocks[2], blocks[4]],
+            }
+
+            for name, translated in variants.items():
+                with self.subTest(name=name):
+                    result = root / f"{name}.docx"
+                    with self.assertRaisesRegex(ValueError, "Блок|Порядок"):
+                        documents.rebuild_docx(source, translated, result)
+                    self.assertFalse(result.exists())
+
     def test_rebuild_preserves_supported_formatting_and_footnote_reference(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -201,6 +221,62 @@ class DocxRoundTripTests(unittest.TestCase):
             self.assertTrue(rebuilt.paragraphs[1].runs[2].bold)
             self.assertTrue(documents.docx_has_footnote_reference(result, "2"))
             self.assertIn("Переведённая сноска", documents.docx_footnote_text(result, "2"))
+
+    def test_rebuild_preserves_reference_in_run_with_translated_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.docx"
+            result = root / "result.docx"
+            blocks_path = root / "blocks.json"
+            make_formatted_docx(source, footnote_in_text_run=True)
+            blocks = documents.extract_docx(source, blocks_path)
+            final_block = next(block for block in blocks if block["идентификатор"] == "B000004")
+            self.assertEqual(["After the break.", ""], [
+                fragment["текст"] for fragment in final_block["фрагменты"]
+            ])
+            self.assertEqual([None, "2"], [
+                fragment["сноска"] for fragment in final_block["фрагменты"]
+            ])
+            translated = copy.deepcopy(blocks)
+            for block in translated:
+                for fragment in block["фрагменты"]:
+                    if fragment["текст"].strip():
+                        fragment["текст"] = "Переведённая сноска" if block["тип"] == "сноска" else "Перевод"
+
+            documents.rebuild_docx(source, translated, result)
+
+            self.assertEqual("Перевод", Document(result).paragraphs[-1].runs[0].text)
+            self.assertTrue(documents.docx_has_footnote_reference(result, "2"))
+
+
+class DocxInspectionTests(unittest.TestCase):
+    def test_inspect_rejects_incomplete_ooxml_package(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "incomplete.docx"
+            with zipfile.ZipFile(source, "w") as archive:
+                archive.writestr("word/document.xml", f'<w:document xmlns:w="{W}"/>')
+
+            self.assertEqual(
+                ["Документ DOCX повреждён или защищён паролем."],
+                documents.inspect_docx(source),
+            )
+
+    def test_extract_rejects_table_in_word_xml_part_before_writing_blocks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "chapter.docx"
+            target = root / "blocks.json"
+            make_docx(source)
+            _rewrite_zip(source, {
+                "word/header1.xml": (
+                    f'<w:hdr xmlns:w="{FIXTURE_W}"><w:tbl/></w:hdr>'.encode("utf-8")
+                )
+            })
+
+            with self.assertRaisesRegex(ValueError, "таблиц"):
+                documents.extract_docx(source, target)
+
+            self.assertFalse(target.exists())
 
 
 if __name__ == "__main__":

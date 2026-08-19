@@ -272,13 +272,16 @@ def _run_footnote_id(run) -> str | None:
     return None
 
 
-def _run_fragment(run) -> dict:
-    return {
+def _run_fragments(run) -> list[dict]:
+    fragment = {
         "текст": run.text,
         "курсив": bool(run.italic),
         "полужирный": bool(run.bold),
         "сноска": _run_footnote_id(run),
     }
+    if fragment["сноска"] is None or not fragment["текст"]:
+        return [fragment]
+    return [{**fragment, "сноска": None}, {**fragment, "текст": ""}]
 
 
 def _footnote_fragments(paragraph) -> tuple[str, list[dict]]:
@@ -297,14 +300,16 @@ def _footnote_fragments(paragraph) -> tuple[str, list[dict]]:
             return element is not None and element.get(f"{{{W}}}val", "1") not in {"0", "false", "False"}
 
         reference = run.find(f"./{{{W}}}footnoteReference")
-        fragments.append(
-            {
-                "текст": "".join(text.text or "" for text in run.findall(f".//{{{W}}}t")),
-                "курсив": has_property("i"),
-                "полужирный": has_property("b"),
-                "сноска": None if reference is None else reference.get(f"{{{W}}}id"),
-            }
-        )
+        fragment = {
+            "текст": "".join(text.text or "" for text in run.findall(f".//{{{W}}}t")),
+            "курсив": has_property("i"),
+            "полужирный": has_property("b"),
+            "сноска": None if reference is None else reference.get(f"{{{W}}}id"),
+        }
+        if fragment["сноска"] is not None and fragment["текст"]:
+            fragments.extend([{**fragment, "сноска": None}, {**fragment, "текст": ""}])
+        else:
+            fragments.append(fragment)
     return style, fragments
 
 
@@ -330,18 +335,26 @@ def inspect_docx(path: Path) -> list[str]:
     try:
         with zipfile.ZipFile(path) as archive:
             names = set(archive.namelist())
-            if "word/document.xml" not in names:
+            required_parts = {"[Content_Types].xml", "_rels/.rels", "word/document.xml"}
+            if not required_parts <= names:
                 return ["Документ DOCX повреждён или защищён паролем."]
+            for name in required_parts:
+                ElementTree.fromstring(archive.read(name))
             warnings = [message for name, message in UNSUPPORTED_PARTS.items() if name in names]
             found = set()
+            contains_table = False
             for name in names:
                 if not name.startswith("word/") or not name.endswith(".xml"):
                     continue
                 root = ElementTree.fromstring(archive.read(name))
                 for element in root.iter():
+                    if element.tag == f"{{{W}}}tbl":
+                        contains_table = True
                     local_name = element.tag.rsplit("}", 1)[-1]
                     if local_name in UNSUPPORTED_XML:
                         found.add(local_name)
+            if contains_table:
+                warnings.append("Документы с таблицами пока не поддерживаются.")
             return warnings + [
                 message for name, message in UNSUPPORTED_XML.items() if name in found
             ]
@@ -360,7 +373,7 @@ def extract_docx(source: Path, destination: Path) -> list[dict]:
     inserted_footnotes = set()
     blocks = []
     for number, paragraph in enumerate(document.paragraphs, start=1):
-        fragments = [_run_fragment(run) for run in paragraph.runs]
+        fragments = [fragment for run in paragraph.runs for fragment in _run_fragments(run)]
         blocks.append(
             {
                 "идентификатор": f"B{number:06d}",
@@ -398,7 +411,7 @@ def _replace_run_text(run, text: str) -> None:
     text_elements = list(run.iter(f"{{{W}}}t"))
     if not text_elements:
         if text:
-            raise ValueError("Структура оформления сноски изменилась.")
+            raise ValueError("Структура оформления документа изменилась.")
         return
     text_elements[0].text = text
     for element in text_elements[1:]:
@@ -442,17 +455,20 @@ def _replace_footnote_text_in_package(path: Path, blocks: list[dict]) -> None:
         paragraph_index = int(paragraph_number) - 1
         if paragraph_index >= len(paragraphs):
             raise ValueError(f"Структура оформления блока {block['идентификатор']} изменилась.")
-        runs = [
-            run for run in paragraphs[paragraph_index].findall(f"./{{{W}}}r")
-            if _run_footnote_id(run) is None
-        ]
-        fragments = [
-            fragment for fragment in _fragments(block) if fragment.get("сноска") is None
-        ]
-        if len(runs) != len(fragments):
+        fragments = _fragments(block)
+        fragment_index = 0
+        for run in paragraphs[paragraph_index].findall(f"./{{{W}}}r"):
+            text = "".join(item.text or "" for item in run.iter(f"{{{W}}}t"))
+            reference = _run_footnote_id(run)
+            if text or reference is None:
+                if fragment_index >= len(fragments):
+                    raise ValueError(f"Структура оформления блока {block['идентификатор']} изменилась.")
+                _replace_run_text(run, fragments[fragment_index]["текст"])
+                fragment_index += 1
+            if reference is not None:
+                fragment_index += 1
+        if fragment_index != len(fragments):
             raise ValueError(f"Структура оформления блока {block['идентификатор']} изменилась.")
-        for run, fragment in zip(runs, fragments, strict=True):
-            _replace_run_text(run, fragment["текст"])
     _rewrite_docx_package(
         path,
         {"word/footnotes.xml": ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)},
@@ -460,6 +476,13 @@ def _replace_footnote_text_in_package(path: Path, blocks: list[dict]) -> None:
 
 
 def rebuild_docx(template: Path, translated_blocks: list[dict], destination: Path) -> None:
+    if not isinstance(translated_blocks, list):
+        raise ValueError("Проверенный перевод должен содержать список блоков.")
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        expected_blocks = extract_docx(template, Path(temporary_directory) / "blocks.json")
+    errors = validate_translation(expected_blocks, translated_blocks)
+    if errors:
+        raise ValueError(" ".join(errors))
     document = Document(template)
     main_blocks = [block for block in translated_blocks if block.get("тип") != "сноска"]
     if len(document.paragraphs) != len(main_blocks):
@@ -467,14 +490,22 @@ def rebuild_docx(template: Path, translated_blocks: list[dict], destination: Pat
     for paragraph, block in zip(document.paragraphs, main_blocks, strict=True):
         if block.get("тип") == "разрыв_сцены":
             continue
-        text_runs = [run for run in paragraph.runs if _run_footnote_id(run) is None]
-        fragments = [
-            fragment for fragment in _fragments(block) if fragment.get("сноска") is None
-        ]
-        if len(text_runs) != len(fragments):
+        fragments = _fragments(block)
+        fragment_index = 0
+        for run in paragraph.runs:
+            reference = _run_footnote_id(run)
+            if run.text or reference is None:
+                if fragment_index >= len(fragments):
+                    raise ValueError(f"Структура оформления блока {block['идентификатор']} изменилась.")
+                if reference is None:
+                    run.text = fragments[fragment_index]["текст"]
+                else:
+                    _replace_run_text(run._r, fragments[fragment_index]["текст"])
+                fragment_index += 1
+            if reference is not None:
+                fragment_index += 1
+        if fragment_index != len(fragments):
             raise ValueError(f"Структура оформления блока {block['идентификатор']} изменилась.")
-        for run, fragment in zip(text_runs, fragments, strict=True):
-            run.text = fragment["текст"]
     destination.parent.mkdir(parents=True, exist_ok=True)
     document.save(destination)
     try:
