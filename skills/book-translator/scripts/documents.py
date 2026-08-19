@@ -121,26 +121,23 @@ def verify_manifest(project_dir: Path, manifest: dict) -> list[str]:
         else:
             return [str(error)]
 
-    current_paths = {
-        _relative_path(project_dir, path).casefold(): path for path in current
-    }
+    current_paths = {_relative_path(project_dir, path): path for path in current}
     errors = []
+    missing = False
     for chapter in manifest["главы"]:
         relative = Path(chapter["путь"]).as_posix()
-        path = current_paths.get(relative.casefold())
+        path = current_paths.get(relative)
         if path is None:
+            missing = True
             errors.append(f"Глава «{chapter.get('имя', relative)}» удалена.")
             continue
         expected = chapter.get("sha256")
         if not isinstance(expected, str) or file_sha256(path) != expected:
             errors.append(f"Глава «{path.name}» изменена.")
 
-    current_order = [
-        _relative_path(project_dir, path).casefold()
-        for path in current
-    ]
-    expected_order = [path.casefold() for path in manifest_paths]
-    if expected_order != current_order[: len(expected_order)]:
+    current_order = [_relative_path(project_dir, path) for path in current]
+    expected_order = manifest_paths
+    if not missing and expected_order != current_order[: len(expected_order)]:
         new_paths = [path for path in current_order if path not in expected_order]
         if new_paths:
             errors.append(
@@ -160,6 +157,43 @@ def _output_suffix(chapter: Path, output_format: str) -> str | None:
     return None
 
 
+def _confirmed_outputs(
+    project_dir: Path, chapters: list[Path], output_format: str
+) -> tuple[set[str], str | None, str | None]:
+    progress_path = project_dir / "progress.json"
+    try:
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return set(), None, None
+    if not isinstance(progress, dict):
+        return set(), None, None
+
+    last_ready = progress.get("последняя_готовая_глава")
+    if last_ready is None:
+        return set(), None, None
+    ordered = sorted(chapters, key=natural_key)
+    try:
+        last_index = next(
+            index for index, chapter in enumerate(ordered)
+            if chapter.name == last_ready
+        )
+    except StopIteration:
+        return set(), None, None
+    confirmed = set()
+    last_name = None
+    for chapter in ordered[: last_index + 1]:
+        suffix = _output_suffix(chapter, output_format)
+        if suffix is None:
+            return set(), None, None
+        name = f"{chapter.stem}{suffix}"
+        confirmed.add(name.casefold())
+        last_name = name
+    result_hash = progress.get("sha256_результата")
+    if result_hash is not None and not isinstance(result_hash, str):
+        return set(), None, None
+    return confirmed, last_name.casefold() if last_name else None, result_hash
+
+
 def check_output_conflicts(
     project_dir: Path, chapters: list[Path], output_format: str
 ) -> list[str]:
@@ -167,6 +201,9 @@ def check_output_conflicts(
     output_dir = project_dir / "output"
     names = {}
     errors = []
+    confirmed, last_confirmed, result_hash = _confirmed_outputs(
+        project_dir, chapters, output_format
+    )
     for chapter in sorted(chapters, key=natural_key):
         suffix = _output_suffix(chapter, output_format)
         if suffix is None:
@@ -187,8 +224,17 @@ def check_output_conflicts(
                 (path for path in output_dir.iterdir() if path.name.casefold() == folded),
                 None,
             )
-            if existing is not None:
+            if existing is not None and existing.name.casefold() not in confirmed:
                 errors.append(
                     f"Выходной файл «{existing.name}» уже существует и не подтверждён текущей контрольной точкой."
+                )
+            elif (
+                existing is not None
+                and existing.name.casefold() == last_confirmed
+                and result_hash is not None
+                and file_sha256(existing) != result_hash
+            ):
+                errors.append(
+                    f"Выходной файл «{existing.name}» не совпадает с контрольной суммой контрольной точки."
                 )
     return errors

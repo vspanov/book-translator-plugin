@@ -110,6 +110,58 @@ class ChapterDiscoveryTests(unittest.TestCase):
             errors = documents.check_output_conflicts(project, [chapter], "docx")
             self.assertTrue(any("уже существует" in error for error in errors))
 
+    def test_confirmed_output_before_checkpoint_is_allowed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            chapter = project / "chapter-1.docx"
+            chapter.write_bytes(b"source")
+            output = project / "output"
+            output.mkdir()
+            result = output / "chapter-1.docx"
+            result.write_bytes(b"published")
+            (project / "progress.json").write_text(
+                json.dumps(
+                    {
+                        "версия": 1,
+                        "последняя_готовая_глава": "chapter-1.docx",
+                        "sha256_результата": documents.file_sha256(result),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual([], documents.check_output_conflicts(project, [chapter], "docx"))
+
+    def test_deleted_chapter_and_appended_chapter_report_only_deletion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            first = project / "chapter-1.docx"
+            second = project / "chapter-2.docx"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            manifest = documents.build_manifest(project, [first, second])
+            first.unlink()
+            (project / "chapter-3.docx").write_bytes(b"third")
+
+            errors = documents.verify_manifest(project, manifest)
+
+            self.assertTrue(any("удалена" in error for error in errors))
+            self.assertFalse(any("после последней" in error for error in errors))
+
+    def test_case_changed_manifest_path_is_reported_as_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            original = project / "Chapter-K.docx"
+            original.write_bytes(b"same")
+            manifest = documents.build_manifest(project, [original])
+            original.unlink()
+            renamed = project / "chapter-k.docx"
+            renamed.write_bytes(b"same")
+
+            errors = documents.verify_manifest(project, manifest)
+
+            self.assertTrue(any("удалена" in error for error in errors))
+
 
 if __name__ == "__main__":
     unittest.main()
