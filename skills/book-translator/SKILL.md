@@ -84,6 +84,10 @@ description: Используется, когда нужно перевести 
 
 ### Шаблон: translator
 
+Custom agent: book_translator_translator
+Параметр изоляции запуска: fork_turns="none".
+Стартовое сообщение: только приведённые ниже абсолютные пути; ноль turns/истории родителя.
+
 ```text
 Роль: book_translator_translator, художественный переводчик.
 Абсолютный путь к правилам: {plugin_root}/skills/book-translator/references/translation-principles.md
@@ -94,6 +98,10 @@ description: Используется, когда нужно перевести 
 ```
 
 ### Шаблон: verifier 1
+
+Custom agent: book_translator_verifier
+Параметр изоляции запуска: fork_turns="none".
+Стартовое сообщение: только приведённые ниже абсолютные пути; ноль turns/истории родителя.
 
 ```text
 Роль: book_translator_verifier, независимая проверка 1.
@@ -106,6 +114,10 @@ description: Используется, когда нужно перевести 
 ```
 
 ### Шаблон: editor 1
+
+Custom agent: book_translator_editor
+Параметр изоляции запуска: fork_turns="none".
+Стартовое сообщение: только приведённые ниже абсолютные пути; ноль turns/истории родителя.
 
 ```text
 Роль: book_translator_editor, литературная редактура 1.
@@ -120,6 +132,10 @@ description: Используется, когда нужно перевести 
 
 ### Шаблон: verifier 2
 
+Custom agent: book_translator_verifier
+Параметр изоляции запуска: fork_turns="none".
+Стартовое сообщение: только приведённые ниже абсолютные пути; ноль turns/истории родителя.
+
 ```text
 Роль: book_translator_verifier, независимая проверка 2.
 Абсолютный путь к правилам: {plugin_root}/skills/book-translator/references/verification-rules.md
@@ -131,6 +147,10 @@ description: Используется, когда нужно перевести 
 ```
 
 ### Шаблон: editor 2
+
+Custom agent: book_translator_editor
+Параметр изоляции запуска: fork_turns="none".
+Стартовое сообщение: только приведённые ниже абсолютные пути; ноль turns/истории родителя.
 
 ```text
 Роль: book_translator_editor, литературная редактура 2.
@@ -145,6 +165,10 @@ description: Используется, когда нужно перевести 
 
 ### Шаблон: verifier 3
 
+Custom agent: book_translator_verifier
+Параметр изоляции запуска: fork_turns="none".
+Стартовое сообщение: только приведённые ниже абсолютные пути; ноль turns/истории родителя.
+
 ```text
 Роль: book_translator_verifier, независимая проверка 3.
 Абсолютный путь к правилам: {plugin_root}/skills/book-translator/references/verification-rules.md
@@ -156,6 +180,10 @@ description: Используется, когда нужно перевести 
 ```
 
 ### Шаблон: state-updater
+
+Custom agent: book_translator_state_updater
+Параметр изоляции запуска: fork_turns="none".
+Стартовое сообщение: только приведённые ниже абсолютные пути; ноль turns/истории родителя.
 
 ```text
 Роль: book_translator_state_updater, хранитель памяти принятой главы.

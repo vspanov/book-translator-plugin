@@ -138,14 +138,30 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("только после успешной фиксации", self.lower)
 
     def test_start_tasks_use_absolute_inputs_and_exactly_one_output(self):
-        templates = re.findall(
-            r"### Шаблон: .+?\n\n```text\n(.*?)\n```",
+        sections = dict(re.findall(
+            r"### Шаблон: ([^\n]+)\n(.*?)(?=\n### Шаблон:|\n## Самопроверка координатора)",
             self.text,
             flags=re.DOTALL,
-        )
-        self.assertEqual(7, len(templates))
-        for template in templates:
-            with self.subTest(template=template.splitlines()[0]):
+        ))
+        expected_agents = {
+            "translator": "book_translator_translator",
+            "verifier 1": "book_translator_verifier",
+            "editor 1": "book_translator_editor",
+            "verifier 2": "book_translator_verifier",
+            "editor 2": "book_translator_editor",
+            "verifier 3": "book_translator_verifier",
+            "state-updater": "book_translator_state_updater",
+        }
+        self.assertEqual(set(expected_agents), set(sections))
+        templates = []
+        for heading, agent_name in expected_agents.items():
+            with self.subTest(template=heading):
+                section = sections[heading]
+                template = re.search(r"```text\n(.*?)\n```", section, flags=re.DOTALL).group(1)
+                templates.append(template)
+                self.assertIn(f"Custom agent: {agent_name}", section)
+                self.assertIn('Параметр изоляции запуска: fork_turns="none".', section)
+                self.assertIn("ноль turns/истории родителя", section)
                 self.assertIn("Абсолютный путь", template)
                 self.assertEqual(1, template.count("Единственный output:"))
                 self.assertTrue(template.endswith("Не используй сведения вне перечисленных файлов."))
