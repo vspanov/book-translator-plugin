@@ -24,7 +24,9 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("pages", description.casefold())
         self.assertRegex(description.casefold(), r"продолж|перезапуск|заново")
         self.assertNotRegex(description.casefold(), r"последовательно|провер|агент|этап|сначала|затем")
-        self.assertIn("/book-translator [ПАПКА] [формат: pages|docx|как-в-оригинале] [продолжить|начать-заново]", self.text)
+        self.assertIn("$book-translator [ПАПКА] [формат: pages|docx|как-в-оригинале] [продолжить|начать-заново]", self.text)
+        invocation = self.text.split("Обычный вызов из чата:", 1)[1].lstrip().splitlines()[0]
+        self.assertTrue(invocation.startswith("`$book-translator "))
         self.assertIn("текущая папка", self.lower)
         self.assertIn("как в оригинале", self.lower)
         self.assertIn("продолжить", self.lower)
@@ -48,6 +50,25 @@ class SkillContractTests(unittest.TestCase):
             "обработанный исходник изменён",
         ):
             self.assertIn(phrase, self.lower)
+
+    def test_agent_installer_uses_absolute_preview_and_confirm_commands(self):
+        preview = (
+            '"{python_executable}" '
+            '"{plugin_root}/skills/book-translator/scripts/install-agents.py" '
+            '--source "{plugin_root}/agents" --target "{codex_home}/agents" --plan'
+        )
+        confirm = preview.removesuffix(" --plan") + " --confirm"
+        self.assertIn(preview, self.text)
+        self.assertIn(confirm, self.text)
+        self.assertIn("сначала вычисли абсолютные пути", self.lower)
+        self.assertIn("отдельное подтверждение", self.lower)
+        self.assertIn('--overwrite "{точное_имя}.toml"', self.text)
+
+    def test_custom_agents_use_zero_parent_turns(self):
+        self.assertIn('fork_turns="none"', self.text)
+        self.assertIn("agent_name", self.text)
+        self.assertIn("только заполненный шаблон", self.lower)
+        self.assertIn("запуск с наследованием истории по умолчанию запрещён", self.lower)
 
     def test_fresh_agents_are_strictly_sequential(self):
         required_in_order = [
@@ -90,6 +111,24 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("сохрани отчёт", self.lower)
         self.assertIn("не публикуй главу", self.lower)
 
+    def test_second_edit_and_third_verifier_advance_explicit_stages(self):
+        workflow = self.text.split("## Порядок одной главы", 1)[1].split("## Длинная глава", 1)[0]
+        required_in_order = (
+            "request_second_edit",
+            "edited-2.json",
+            "validate_translation",
+            'advance_stage(project, "редактура_2", artifact=edited_2)',
+            "report-3.json",
+            'advance_stage(project, "проверка_3", artifact=report_3)',
+            "record_failure",
+            "сборка",
+        )
+        start = 0
+        for phrase in required_in_order:
+            position = workflow.find(phrase, start)
+            self.assertGreaterEqual(position, 0, phrase)
+            start = position + len(phrase)
+
     def test_state_changes_only_after_an_accepted_built_chapter(self):
         self.assertIn("только один раз", self.lower)
         self.assertIn("окончательно принят", self.lower)
@@ -130,6 +169,15 @@ class UniversalReferenceTests(unittest.TestCase):
             "естественной русской прозы",
         ):
             self.assertIn(phrase, text)
+
+    def test_manual_project_glossary_has_priority(self):
+        text = (REFERENCES / "translation-principles.md").read_text(encoding="utf-8").casefold()
+        self.assertIn("glossary.md", text)
+        self.assertIn("абсолютный приоритет", text)
+        self.assertIn("установленные имена и термины", text)
+        self.assertIn("последовательно", text)
+        self.assertIn("decisions.md", text)
+        self.assertIn("не меняй молча", text)
 
     def test_verification_has_three_outcomes_and_mechanical_precedence(self):
         text = (REFERENCES / "verification-rules.md").read_text(encoding="utf-8").casefold()
