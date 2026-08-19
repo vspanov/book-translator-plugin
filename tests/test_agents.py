@@ -39,6 +39,13 @@ class AgentDefinitionTests(unittest.TestCase):
                 self.assertNotIn("model_reasoning_effort", data)
                 self.assertIn("рус", (data["description"] + data["developer_instructions"]).lower())
 
+    def test_editor_limits_changes_to_verified_findings(self):
+        instructions = tomllib.loads((ROOT / "agents" / "editor.toml").read_text(encoding="utf-8"))["developer_instructions"].lower()
+        self.assertIn("только блоки", instructions)
+        self.assertIn("из отчёта verifier", instructions)
+        self.assertIn("не изменяй остальные блоки", instructions)
+        self.assertIn("не проводи свободную повторную редактуру", instructions)
+
 
 class AgentInstallationTests(unittest.TestCase):
     def setUp(self):
