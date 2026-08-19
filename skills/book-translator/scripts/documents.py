@@ -334,7 +334,10 @@ def _footnotes(source: Path) -> dict[str, list[tuple[str, list[dict]]]]:
 def inspect_docx(path: Path) -> list[str]:
     try:
         with zipfile.ZipFile(path) as archive:
-            names = set(archive.namelist())
+            entries = archive.infolist()
+            names = {entry.filename for entry in entries}
+            if len(entries) != len(names):
+                return ["Документ DOCX повреждён или защищён паролем."]
             required_parts = {
                 "[Content_Types].xml",
                 "_rels/.rels",
@@ -343,15 +346,15 @@ def inspect_docx(path: Path) -> list[str]:
             }
             if not required_parts <= names:
                 return ["Документ DOCX повреждён или защищён паролем."]
-            xml_parts = {
-                name: ElementTree.fromstring(archive.read(name))
-                for name in names
-                if name.endswith((".xml", ".rels"))
-            }
+            xml_parts = [
+                (entry.filename, ElementTree.fromstring(archive.read(entry)))
+                for entry in entries
+                if entry.filename.endswith((".xml", ".rels"))
+            ]
             warnings = [message for name, message in UNSUPPORTED_PARTS.items() if name in names]
             found = set()
             contains_table = False
-            for name, root in xml_parts.items():
+            for name, root in xml_parts:
                 if not name.startswith("word/"):
                     continue
                 for element in root.iter():

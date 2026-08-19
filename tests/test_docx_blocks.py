@@ -3,6 +3,7 @@ import json
 import sys
 import tempfile
 import unittest
+import warnings
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
@@ -250,6 +251,30 @@ class DocxRoundTripTests(unittest.TestCase):
 
 
 class DocxInspectionTests(unittest.TestCase):
+    def test_inspect_rejects_malformed_xml_before_valid_duplicate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "duplicate-core.docx"
+            make_docx(source)
+            with zipfile.ZipFile(source) as archive:
+                contents = {
+                    name: archive.read(name)
+                    for name in archive.namelist()
+                    if name != "docProps/core.xml"
+                }
+                valid_core = archive.read("docProps/core.xml")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                with zipfile.ZipFile(source, "w", zipfile.ZIP_DEFLATED) as archive:
+                    for name, content in contents.items():
+                        archive.writestr(name, content)
+                    archive.writestr("docProps/core.xml", b"<broken")
+                    archive.writestr("docProps/core.xml", valid_core)
+
+            self.assertEqual(
+                ["Документ DOCX повреждён или защищён паролем."],
+                documents.inspect_docx(source),
+            )
+
     def test_inspect_rejects_package_without_document_relationships(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "missing-rels.docx"
