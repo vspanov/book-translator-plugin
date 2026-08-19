@@ -335,18 +335,25 @@ def inspect_docx(path: Path) -> list[str]:
     try:
         with zipfile.ZipFile(path) as archive:
             names = set(archive.namelist())
-            required_parts = {"[Content_Types].xml", "_rels/.rels", "word/document.xml"}
+            required_parts = {
+                "[Content_Types].xml",
+                "_rels/.rels",
+                "word/document.xml",
+                "word/_rels/document.xml.rels",
+            }
             if not required_parts <= names:
                 return ["Документ DOCX повреждён или защищён паролем."]
-            for name in required_parts:
-                ElementTree.fromstring(archive.read(name))
+            xml_parts = {
+                name: ElementTree.fromstring(archive.read(name))
+                for name in names
+                if name.endswith((".xml", ".rels"))
+            }
             warnings = [message for name, message in UNSUPPORTED_PARTS.items() if name in names]
             found = set()
             contains_table = False
-            for name in names:
-                if not name.startswith("word/") or not name.endswith(".xml"):
+            for name, root in xml_parts.items():
+                if not name.startswith("word/"):
                     continue
-                root = ElementTree.fromstring(archive.read(name))
                 for element in root.iter():
                     if element.tag == f"{{{W}}}tbl":
                         contains_table = True

@@ -250,6 +250,36 @@ class DocxRoundTripTests(unittest.TestCase):
 
 
 class DocxInspectionTests(unittest.TestCase):
+    def test_inspect_rejects_package_without_document_relationships(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "missing-rels.docx"
+            make_docx(source)
+            with zipfile.ZipFile(source) as archive:
+                contents = {
+                    name: archive.read(name)
+                    for name in archive.namelist()
+                    if name != "word/_rels/document.xml.rels"
+                }
+            with zipfile.ZipFile(source, "w", zipfile.ZIP_DEFLATED) as archive:
+                for name, content in contents.items():
+                    archive.writestr(name, content)
+
+            self.assertEqual(
+                ["Документ DOCX повреждён или защищён паролем."],
+                documents.inspect_docx(source),
+            )
+
+    def test_inspect_rejects_malformed_optional_xml_part(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "malformed-core.docx"
+            make_docx(source)
+            _rewrite_zip(source, {"docProps/core.xml": b"<broken"})
+
+            self.assertEqual(
+                ["Документ DOCX повреждён или защищён паролем."],
+                documents.inspect_docx(source),
+            )
+
     def test_inspect_rejects_incomplete_ooxml_package(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "incomplete.docx"
