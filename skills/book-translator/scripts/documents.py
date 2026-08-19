@@ -12,9 +12,6 @@ import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
 
-from docx import Document
-
-
 SUPPORTED_SUFFIXES = {".docx", ".pages"}
 EXCLUDED_DIRECTORIES = {"output", "state", "work"}
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -74,6 +71,19 @@ def run_pages_bridge(mode: str, source: Path, destination: Path, allowed: bool) 
         raise PermissionError("Для запуска Pages требуется явное разрешение пользователя.")
     if mode not in {"export", "import"}:
         raise ValueError("Направление Pages должно быть export или import.")
+    if not source.exists():
+        raise FileNotFoundError(f"Исходный документ Pages не найден: {source}.")
+    expected_suffixes = {
+        "export": (".pages", ".docx"),
+        "import": (".docx", ".pages"),
+    }
+    source_suffix, destination_suffix = expected_suffixes[mode]
+    if source.suffix.casefold() != source_suffix or destination.suffix.casefold() != destination_suffix:
+        raise ValueError(
+            f"Неподходящий формат для {mode}: ожидаются {source_suffix} и {destination_suffix}."
+        )
+    if destination.exists():
+        raise FileExistsError(f"Итоговый документ уже существует: {destination}.")
     script = Path(__file__).with_name("pages-bridge.applescript")
     try:
         completed = subprocess.run(
@@ -87,6 +97,12 @@ def run_pages_bridge(mode: str, source: Path, destination: Path, allowed: bool) 
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip() or "неизвестная ошибка"
         raise RuntimeError(f"Pages не смог обработать документ: {detail}")
+    try:
+        has_result = any(destination.iterdir()) if destination.is_dir() else destination.is_file() and destination.stat().st_size > 0
+    except OSError:
+        has_result = False
+    if not has_result:
+        raise RuntimeError("Pages не создал итоговый документ или результат пуст.")
 
 
 def natural_key(path: Path) -> tuple:
@@ -437,6 +453,8 @@ def inspect_docx(path: Path) -> list[str]:
 
 
 def extract_docx(source: Path, destination: Path) -> list[dict]:
+    from docx import Document
+
     errors = inspect_docx(source)
     if errors:
         raise ValueError(" ".join(errors))
@@ -550,6 +568,8 @@ def _replace_footnote_text_in_package(path: Path, blocks: list[dict]) -> None:
 
 
 def rebuild_docx(template: Path, translated_blocks: list[dict], destination: Path) -> None:
+    from docx import Document
+
     if not isinstance(translated_blocks, list):
         raise ValueError("Проверенный перевод должен содержать список блоков.")
     with tempfile.TemporaryDirectory() as temporary_directory:

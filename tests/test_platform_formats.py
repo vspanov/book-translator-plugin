@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -46,6 +47,7 @@ class PlatformFormatTests(unittest.TestCase):
             root = Path(directory)
             source = root / "source.pages"
             destination = root / "result.docx"
+            source.mkdir()
             with patch.object(documents.subprocess, "run", return_value=completed) as run:
                 with self.assertRaisesRegex(RuntimeError, "Pages не смог"):
                     documents.run_pages_bridge("export", source, destination, allowed=True)
@@ -56,6 +58,83 @@ class PlatformFormatTests(unittest.TestCase):
         self.assertEqual(str(source.resolve()), command[3])
         self.assertEqual(str(destination.resolve()), command[4])
         self.assertNotIn("shell", run.call_args.kwargs)
+
+    def test_pages_bridge_rejects_missing_source_before_starting_process(self):
+        with patch.object(documents.subprocess, "run") as run:
+            with self.assertRaisesRegex(FileNotFoundError, "не найден"):
+                documents.run_pages_bridge("export", Path("missing.pages"), Path("result.docx"), allowed=True)
+
+        run.assert_not_called()
+
+    def test_pages_bridge_rejects_wrong_suffix_before_starting_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cases = {
+                "исходник": (root / "source.docx", root / "result.docx"),
+                "результат": (root / "source.pages", root / "result.pages"),
+            }
+            for name, (source, destination) in cases.items():
+                with self.subTest(name=name):
+                    if source.suffix == ".pages":
+                        source.mkdir()
+                    else:
+                        source.write_bytes(b"docx")
+                    with patch.object(documents.subprocess, "run") as run:
+                        with self.assertRaisesRegex(ValueError, "формат"):
+                            documents.run_pages_bridge("export", source, destination, allowed=True)
+
+                    run.assert_not_called()
+
+    def test_pages_bridge_rejects_existing_destination_before_starting_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.pages"
+            destination = root / "result.docx"
+            source.mkdir()
+            destination.write_bytes(b"existing")
+            with patch.object(documents.subprocess, "run") as run:
+                with self.assertRaisesRegex(FileExistsError, "уже существует"):
+                    documents.run_pages_bridge("export", source, destination, allowed=True)
+
+        run.assert_not_called()
+
+    def test_pages_bridge_rejects_missing_or_empty_successful_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.pages"
+            source.mkdir()
+            for name, create_result in {
+                "отсутствующий": lambda path: None,
+                "пустой_файл": lambda path: path.touch(),
+                "пустая_папка": lambda path: path.mkdir(),
+            }.items():
+                with self.subTest(name=name):
+                    destination = root / f"{name}.docx"
+                    def complete(command, **_):
+                        create_result(destination)
+                        return documents.subprocess.CompletedProcess(command, 0, "", "")
+
+                    with patch.object(documents.subprocess, "run", side_effect=complete):
+                        with self.assertRaisesRegex(RuntimeError, "не создан|пуст"):
+                            documents.run_pages_bridge("export", source, destination, allowed=True)
+
+    def test_pages_bridge_accepts_nonempty_pages_package_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.DOCX"
+            destination = root / "result.PAGES"
+            source.write_bytes(b"docx")
+
+            def complete(command, **_):
+                destination.mkdir()
+                (destination / "index.xml").write_text("содержимое", encoding="utf-8")
+                return documents.subprocess.CompletedProcess(command, 0, "", "")
+
+            with patch.object(documents.subprocess, "run", side_effect=complete):
+                documents.run_pages_bridge("import", source, destination, allowed=True)
+
+            self.assertTrue(destination.is_dir())
+            self.assertTrue(any(destination.iterdir()))
 
     def test_pages_bridge_rejects_unknown_mode_before_starting_process(self):
         with patch.object(documents.subprocess, "run") as run:
@@ -84,6 +163,42 @@ class PlatformFormatTests(unittest.TestCase):
 
         self.assertEqual({"python", "python_version", "python_docx"}, set(report))
         self.assertEqual(sys.executable, report["python"])
+
+    def test_preflight_and_report_work_when_python_docx_cannot_be_imported(self):
+        code = f'''\
+import importlib.abc
+import importlib.metadata
+import json
+import sys
+
+class BlockDocx(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "docx" or fullname.startswith("docx."):
+            raise ModuleNotFoundError("python-docx недоступен")
+        return None
+
+def missing_package(name):
+    raise importlib.metadata.PackageNotFoundError(name)
+
+sys.meta_path.insert(0, BlockDocx())
+importlib.metadata.version = missing_package
+sys.path.insert(0, {str(SCRIPTS)!r})
+import documents
+print(json.dumps({{
+    "formats": documents.preflight_formats({{".docx"}}, "docx", "Windows", False),
+    "dependency": documents.preflight_dependency(None),
+    "report": documents.runtime_report(),
+}}))
+'''
+        completed = documents.subprocess.run(
+            [sys.executable, "-c", code], text=True, capture_output=True, check=False
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        report = json.loads(completed.stdout)
+        self.assertEqual([], report["formats"])
+        self.assertTrue(report["dependency"])
+        self.assertIsNone(report["report"]["python_docx"])
 
     @unittest.skipUnless(sys.platform == "darwin", "Проверка Pages выполняется только на macOS")
     @unittest.skipUnless(
