@@ -70,6 +70,21 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("только заполненный шаблон", self.lower)
         self.assertIn("запуск с наследованием истории по умолчанию запрещён", self.lower)
 
+    def test_global_start_message_shape_names_every_allowed_part(self):
+        rules = self.text.split("## Неподвижные правила", 1)[1].split("## Порядок одной главы", 1)[0]
+        shape = next(line for line in rules.splitlines() if "Стартовое задание" in line)
+        self.assertRegex(
+            shape,
+            r"финальн\w+ инструкц\w+ `Не используй сведения вне перечисленных файлов\.`",
+        )
+        for phrase in (
+            "роль",
+            "абсолютные пути необходимых входов",
+            "ровно один абсолютный путь ожидаемого output",
+            "метаданные `agent_name` и `fork_turns` находятся вне стартового сообщения",
+        ):
+            self.assertIn(phrase.casefold(), shape.casefold())
+
     def test_fresh_agents_are_strictly_sequential(self):
         required_in_order = [
             "book_translator_translator",
