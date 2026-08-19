@@ -162,6 +162,22 @@ class ChapterDiscoveryTests(unittest.TestCase):
 
             self.assertTrue(any("удалена" in error for error in errors))
 
+    def test_deleted_last_chapter_and_inserted_earlier_chapter_report_both_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            first = project / "chapter-1.docx"
+            last = project / "chapter-2.docx"
+            first.write_bytes(b"first")
+            last.write_bytes(b"last")
+            manifest = documents.build_manifest(project, [first, last])
+            last.unlink()
+            (project / "chapter-1.5.docx").write_bytes(b"inserted")
+
+            errors = documents.verify_manifest(project, manifest)
+
+            self.assertTrue(any("удалена" in error for error in errors))
+            self.assertTrue(any("после последней" in error for error in errors))
+
 
 if __name__ == "__main__":
     unittest.main()

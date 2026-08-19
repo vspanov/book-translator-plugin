@@ -123,12 +123,10 @@ def verify_manifest(project_dir: Path, manifest: dict) -> list[str]:
 
     current_paths = {_relative_path(project_dir, path): path for path in current}
     errors = []
-    missing = False
     for chapter in manifest["главы"]:
         relative = Path(chapter["путь"]).as_posix()
         path = current_paths.get(relative)
         if path is None:
-            missing = True
             errors.append(f"Глава «{chapter.get('имя', relative)}» удалена.")
             continue
         expected = chapter.get("sha256")
@@ -137,9 +135,10 @@ def verify_manifest(project_dir: Path, manifest: dict) -> list[str]:
 
     current_order = [_relative_path(project_dir, path) for path in current]
     expected_order = manifest_paths
-    if not missing and expected_order != current_order[: len(expected_order)]:
-        new_paths = [path for path in current_order if path not in expected_order]
-        if new_paths:
+    new_paths = [path for path in current_order if path not in expected_order]
+    if expected_order:
+        last_key = natural_key(Path(expected_order[-1]))
+        if any(natural_key(Path(path)) <= last_key for path in new_paths):
             errors.append(
                 "Новые главы должны добавляться только после последней зафиксированной главы."
             )
