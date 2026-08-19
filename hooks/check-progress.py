@@ -12,7 +12,7 @@ sys.stdin.reconfigure(encoding="utf-8")
 sys.stdout.reconfigure(encoding="utf-8")
 PLUGIN_ROOT = Path(os.environ.get("PLUGIN_ROOT", Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(PLUGIN_ROOT / "skills" / "book-translator" / "scripts"))
-from progress import check_consistency
+from progress import _completed_transaction, _is_link, _published_output, check_consistency
 
 
 ALLOW = {"continue": True, "suppressOutput": True}
@@ -50,6 +50,12 @@ def completion_error(project: Path, state: dict) -> str | None:
     names = [chapter["имя"] for chapter in chapters]
     if not names or state.get("последняя_готовая_глава") != names[-1]:
         return "Завершение не согласовано: в очереди остались главы."
+    for chapter_name in names:
+        try:
+            _published_output(project, chapter_name)
+            _completed_transaction(project, chapter_name)
+        except (OSError, ValueError) as error:
+            return f"Завершение не согласовано: глава «{chapter_name}» не готова: {error}"
     return None
 
 
@@ -59,8 +65,18 @@ def evaluate(event: dict) -> dict:
     if project is None:
         return ALLOW
 
+    work = project / "work"
+    active_path = work / "active.json"
+    if _is_link(work) or not work.is_dir() or work.resolve().parent != project:
+        return block("Путь work/ активного перевода небезопасен.")
+    if (
+        _is_link(active_path)
+        or not active_path.is_file()
+        or active_path.resolve().parent != work.resolve()
+    ):
+        return block("Маркер активного перевода небезопасен.")
     try:
-        marker = json.loads((project / "work" / "active.json").read_text(encoding="utf-8"))
+        marker = json.loads(active_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return block("Не удалось прочитать маркер активного перевода.")
     if not isinstance(marker, dict):

@@ -48,7 +48,14 @@ def activate(project: Path, state: dict | None = None) -> None:
 def completed_project(project: Path) -> None:
     progress.initialize_project(project)
     progress.start_chapter(project, "chapter-1.docx")
-    next_state = project / "work" / "next-state"
+    commit_chapter(project, "chapter-1.docx")
+    state = progress.load_progress(project)
+    state.update({"статус_книги": "готово", "необработанных_глав": 0})
+    progress.write_json_atomic(project / "progress.json", state)
+
+
+def commit_chapter(project: Path, chapter_name: str) -> Path:
+    next_state = project / "work" / f"{chapter_name}-state"
     next_state.mkdir()
     for name in progress.STATE_ASSETS:
         (next_state / name).write_text(name, encoding="utf-8")
@@ -56,22 +63,33 @@ def completed_project(project: Path) -> None:
     checkpoint.update({
         "статус_книги": "в_работе",
         "этап": "готово",
-        "последняя_готовая_глава": "chapter-1.docx",
+        "текущая_глава": chapter_name,
+        "последняя_готовая_глава": chapter_name,
         "ошибка": None,
     })
-    result = project / "work" / "result.docx"
+    result = project / "work" / f"{chapter_name}-result.docx"
     result.write_bytes(b"result")
     transaction = progress.prepare_transaction(
         project,
-        "chapter-1.docx",
+        chapter_name,
         result,
         next_state,
         checkpoint,
     )
     progress.commit_transaction(project, transaction)
-    state = progress.load_progress(project)
-    state.update({"статус_книги": "готово", "необработанных_глав": 0})
-    progress.write_json_atomic(project / "progress.json", state)
+    return transaction
+
+
+def make_directory_link(link: Path, target: Path) -> None:
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+        )
+        if completed.returncode:
+            raise OSError(completed.stderr.decode(errors="replace"))
+    else:
+        link.symlink_to(target, target_is_directory=True)
 
 
 class StopHookTests(unittest.TestCase):
@@ -180,6 +198,28 @@ class StopHookTests(unittest.TestCase):
             self.assertEqual("block", result["decision"])
             self.assertIn("очеред", result["reason"].lower())
 
+    def test_blocks_completion_when_an_earlier_manifest_chapter_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            progress.initialize_project(project)
+            progress.start_chapter(project, "chapter-1.docx")
+            first_transaction = commit_chapter(project, "chapter-1.docx")
+            commit_chapter(project, "chapter-2.docx")
+            state = progress.load_progress(project)
+            state.update({"статус_книги": "готово", "необработанных_глав": 0})
+            progress.write_json_atomic(project / "progress.json", state)
+            (project / "work" / "manifest.json").write_text(json.dumps({
+                "версия": 1,
+                "главы": [{"имя": "chapter-1.docx"}, {"имя": "chapter-2.docx"}],
+            }, ensure_ascii=False), encoding="utf-8")
+            (project / "output" / "chapter-1.docx").unlink()
+            shutil.rmtree(first_transaction)
+
+            result = run_hook(project)
+
+            self.assertEqual("block", result["decision"])
+            self.assertIn("chapter-1.docx", result["reason"])
+
     def test_rechecks_when_stop_hook_is_already_active(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
@@ -246,6 +286,50 @@ class StopHookTests(unittest.TestCase):
 
             self.assertEqual("block", result["decision"])
             self.assertIn("маркер", result["reason"].lower())
+
+    def test_blocks_linked_work_before_reading_external_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            activate(project, {
+                "статус_книги": "ошибка",
+                "этап": "проверка_2",
+                "текущая_глава": "chapter-1.docx",
+                "ошибка": "Критический пропуск зафиксирован для исправления.",
+                "необработанных_глав": 1,
+            })
+            external_work = root / "external-work"
+            external_work.mkdir()
+            (external_work / "active.json").write_text("{}", encoding="utf-8")
+            shutil.rmtree(project / "work")
+            try:
+                make_directory_link(project / "work", external_work)
+            except OSError as error:
+                self.skipTest(f"Невозможно создать ссылку: {error}")
+
+            result = run_hook(project)
+
+            self.assertEqual("block", result["decision"])
+            self.assertIn("небезопас", result["reason"].lower())
+
+    def test_finds_active_project_from_child_folder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            activate(project, {
+                "статус_книги": "в_работе",
+                "этап": "перевод",
+                "текущая_глава": "chapter-1.docx",
+                "ошибка": None,
+                "необработанных_глав": 1,
+            })
+            child = project / "work" / "chapter-1"
+            child.mkdir()
+
+            result = run_hook(child)
+
+            self.assertEqual("block", result["decision"])
+            self.assertIn("chapter-1.docx", result["reason"])
 
     def test_import_does_not_create_bytecode_in_clean_plugin_copy(self):
         with tempfile.TemporaryDirectory() as directory:
