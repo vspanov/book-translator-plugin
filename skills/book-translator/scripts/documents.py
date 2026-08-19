@@ -317,6 +317,8 @@ def _footnotes(source: Path) -> dict[str, list[tuple[str, list[dict]]]]:
 
 def extract_docx(source: Path, destination: Path) -> list[dict]:
     document = Document(source)
+    if document.tables:
+        raise ValueError("Документы с таблицами пока не поддерживаются.")
     footnotes = _footnotes(source)
     inserted_footnotes = set()
     blocks = []
@@ -393,6 +395,15 @@ def validate_translation(source_blocks: list[dict], translated_blocks: list[dict
         if not isinstance(block, dict) or block.get("идентификатор") not in source_by_id:
             continue
         identifier = block["идентификатор"]
+        if block.get("тип") != source_by_id[identifier].get("тип"):
+            errors.append(f"Тип блока {identifier} изменён.")
+        translated_fragments = block.get("фрагменты")
+        if not isinstance(translated_fragments, list) or any(
+            not isinstance(fragment, dict) or not isinstance(fragment.get("текст"), str)
+            for fragment in translated_fragments
+        ):
+            errors.append(f"Фрагменты блока {identifier} содержат некорректный текст.")
+            continue
         source_text = "".join(
             fragment.get("текст", "") for fragment in _fragments(source_by_id[identifier]) if isinstance(fragment, dict)
         )

@@ -86,6 +86,21 @@ def block(identifier: str, text: str, *, footnote: str | None = None) -> dict:
 
 
 class DocxBlockTests(unittest.TestCase):
+    def test_rejects_document_with_table_before_writing_blocks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "chapter.docx"
+            target = root / "blocks.json"
+            document = Document()
+            document.add_paragraph("Before the table.")
+            document.add_table(rows=1, cols=1).cell(0, 0).text = "Table text."
+            document.save(source)
+
+            with self.assertRaisesRegex(ValueError, "таблиц"):
+                documents.extract_docx(source, target)
+
+            self.assertFalse(target.exists())
+
     def test_extracts_stable_blocks_formatting_and_referenced_footnote(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -124,6 +139,22 @@ class DocxBlockTests(unittest.TestCase):
                 self.assertTrue(
                     any(word in error.lower() for error in documents.validate_translation(source, copy.deepcopy(translated)))
                 )
+
+    def test_rejects_changed_block_type(self):
+        source = [{**block("B000001", "* * *"), "тип": "разрыв_сцены"}]
+        translated = [block("B000001", "* * *")]
+
+        errors = documents.validate_translation(source, translated)
+
+        self.assertTrue(any("тип" in error.lower() for error in errors))
+
+    def test_reports_null_fragment_text_without_crashing(self):
+        source = [block("B000001", "One")]
+        translated = [{**source[0], "фрагменты": [{**source[0]["фрагменты"][0], "текст": None}]}]
+
+        errors = documents.validate_translation(source, translated)
+
+        self.assertTrue(any("некоррект" in error.lower() for error in errors))
 
     def test_split_blocks_preserves_order_without_splitting_footnote_from_reference(self):
         blocks = [
