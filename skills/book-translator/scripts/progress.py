@@ -186,8 +186,27 @@ def start_chapter(project_dir: Path, chapter_name: str) -> None:
     chapter_name = _chapter_name(chapter_name)
     active_path = _project_directory(project_dir, "work") / "active.json"
     state = load_progress(project_dir)
+    active_chapter = None
+    if _is_link(active_path) or (active_path.exists() and not active_path.is_file()):
+        raise ValueError("Маркер активной главы небезопасен.")
+    if active_path.exists():
+        active = _load_json(active_path, "маркер активной главы")
+        if active.get("проект") != str(project_dir):
+            raise ValueError("Маркер активной главы относится к другому проекту.")
+        try:
+            active_chapter = _chapter_name(active.get("глава"))
+        except ValueError as error:
+            raise ValueError("Маркер активной главы содержит некорректную главу.") from error
     if state.get("статус_книги") == "ошибка" or state.get("ошибка"):
         raise ValueError("Нельзя начать следующую главу при зафиксированной ошибке.")
+    partial_start = active_chapter is not None and state.get("этап") == "готово" and (
+        active_chapter != state.get("текущая_глава")
+        or active_chapter != state.get("последняя_готовая_глава")
+    )
+    if partial_start and chapter_name != active_chapter:
+        raise ValueError(
+            f"Глава «{active_chapter}» уже частично начата; сначала повторите её запуск."
+        )
     if (
         state.get("текущая_глава") is not None and state.get("этап") != "готово"
     ) or (active_path.exists() and state.get("этап") != "готово"):
@@ -202,10 +221,15 @@ def start_chapter(project_dir: Path, chapter_name: str) -> None:
             "артефакты": {},
         }
     )
-    write_json_atomic(
-        active_path,
-        {"проект": str(project_dir), "глава": chapter_name, "время_начала": _utc_now()},
-    )
+    if not partial_start:
+        write_json_atomic(
+            active_path,
+            {
+                "проект": str(project_dir),
+                "глава": chapter_name,
+                "время_начала": _utc_now(),
+            },
+        )
     write_json_atomic(project_dir / "progress.json", state)
 
 

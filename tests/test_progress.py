@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills/book-translator/scripts"
@@ -89,6 +90,52 @@ class ProjectInitializationTests(unittest.TestCase):
 
 
 class StageMachineTests(unittest.TestCase):
+    def test_start_chapter_recovers_marker_written_before_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            progress.initialize_project(project)
+            progress.start_chapter(project, "chapter-1.docx")
+            progress.write_json_atomic(
+                project / "progress.json", ready_progress("chapter-1.docx")
+            )
+            real_write = progress.write_json_atomic
+            write_number = 0
+
+            def fail_second_write(path, value):
+                nonlocal write_number
+                write_number += 1
+                if write_number == 2:
+                    raise OSError("искусственный сбой записи progress")
+                real_write(path, value)
+
+            with (
+                mock.patch.object(progress, "write_json_atomic", fail_second_write),
+                self.assertRaises(OSError),
+            ):
+                progress.start_chapter(project, "chapter-2.docx")
+
+            marker_path = project / "work/active.json"
+            progress_path = project / "progress.json"
+            marker_after_crash = marker_path.read_bytes()
+            progress_after_crash = progress_path.read_bytes()
+            self.assertEqual("chapter-2.docx", json.loads(marker_after_crash)["глава"])
+            self.assertEqual(
+                "chapter-1.docx", json.loads(progress_after_crash)["текущая_глава"]
+            )
+
+            with self.assertRaisesRegex(ValueError, "частично|актив"):
+                progress.start_chapter(project, "chapter-3.docx")
+
+            self.assertEqual(marker_after_crash, marker_path.read_bytes())
+            self.assertEqual(progress_after_crash, progress_path.read_bytes())
+
+            progress.start_chapter(project, "chapter-2.docx")
+
+            self.assertEqual("chapter-2.docx", json.loads(marker_path.read_bytes())["глава"])
+            state = progress.load_progress(project)
+            self.assertEqual("chapter-2.docx", state["текущая_глава"])
+            self.assertEqual("ожидает_извлечения", state["этап"])
+
     def test_stage_cannot_be_skipped_repeated_or_unknown(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
