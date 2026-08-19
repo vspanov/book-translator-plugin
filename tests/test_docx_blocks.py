@@ -8,6 +8,7 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 from docx import Document
+from tests.docx_fixture import make_formatted_docx
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills/book-translator/scripts"
@@ -170,6 +171,36 @@ class DocxBlockTests(unittest.TestCase):
         self.assertEqual([block["идентификатор"] for block in blocks], [block["идентификатор"] for chunk in chunks for block in chunk])
         self.assertEqual([2, 2, 1], [len(chunk) for chunk in chunks])
         self.assertEqual(["B000001", "F7-P1"], [block["идентификатор"] for block in chunks[0]])
+
+
+class DocxRoundTripTests(unittest.TestCase):
+    def test_rebuild_preserves_supported_formatting_and_footnote_reference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.docx"
+            result = root / "result.docx"
+            blocks_path = root / "blocks.json"
+            make_formatted_docx(source)
+            blocks = documents.extract_docx(source, blocks_path)
+            translated = copy.deepcopy(blocks)
+            for block in translated:
+                for fragment in block["фрагменты"]:
+                    if fragment["текст"].strip():
+                        fragment["текст"] = (
+                            "Переведённая сноска"
+                            if block["тип"] == "сноска" else "Перевод"
+                        )
+            self.assertEqual([], documents.validate_translation(blocks, translated))
+
+            documents.rebuild_docx(source, translated, result)
+
+            self.assertEqual([], documents.inspect_docx(result))
+            rebuilt = Document(result)
+            self.assertEqual("Heading 1", rebuilt.paragraphs[0].style.name)
+            self.assertTrue(rebuilt.paragraphs[1].runs[1].italic)
+            self.assertTrue(rebuilt.paragraphs[1].runs[2].bold)
+            self.assertTrue(documents.docx_has_footnote_reference(result, "2"))
+            self.assertIn("Переведённая сноска", documents.docx_footnote_text(result, "2"))
 
 
 if __name__ == "__main__":

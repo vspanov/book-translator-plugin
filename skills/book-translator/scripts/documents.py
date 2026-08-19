@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import tempfile
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
@@ -13,6 +14,15 @@ from docx import Document
 SUPPORTED_SUFFIXES = {".docx", ".pages"}
 EXCLUDED_DIRECTORIES = {"output", "state", "work"}
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+UNSUPPORTED_PARTS = {
+    "word/comments.xml": "Документ содержит комментарии.",
+    "word/people.xml": "Документ содержит данные совместного редактирования.",
+}
+UNSUPPORTED_XML = {
+    "ins": "Документ содержит отслеживаемые вставки.",
+    "del": "Документ содержит отслеживаемые удаления.",
+    "txbxContent": "Документ содержит связанные текстовые блоки.",
+}
 
 
 def natural_key(path: Path) -> tuple:
@@ -256,8 +266,9 @@ def _block_type(paragraph) -> str:
 
 
 def _run_footnote_id(run) -> str | None:
-    for element in run._r.iter(f"{{{W}}}footnoteReference"):
-        return element.get(f"{{{W}}}id")
+    element = getattr(run, "_r", run)
+    for reference in element.iter(f"{{{W}}}footnoteReference"):
+        return reference.get(f"{{{W}}}id")
     return None
 
 
@@ -315,7 +326,33 @@ def _footnotes(source: Path) -> dict[str, list[tuple[str, list[dict]]]]:
     return footnotes
 
 
+def inspect_docx(path: Path) -> list[str]:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = set(archive.namelist())
+            if "word/document.xml" not in names:
+                return ["Документ DOCX повреждён или защищён паролем."]
+            warnings = [message for name, message in UNSUPPORTED_PARTS.items() if name in names]
+            found = set()
+            for name in names:
+                if not name.startswith("word/") or not name.endswith(".xml"):
+                    continue
+                root = ElementTree.fromstring(archive.read(name))
+                for element in root.iter():
+                    local_name = element.tag.rsplit("}", 1)[-1]
+                    if local_name in UNSUPPORTED_XML:
+                        found.add(local_name)
+            return warnings + [
+                message for name, message in UNSUPPORTED_XML.items() if name in found
+            ]
+    except (OSError, RuntimeError, zipfile.BadZipFile, ElementTree.ParseError):
+        return ["Документ DOCX повреждён или защищён паролем."]
+
+
 def extract_docx(source: Path, destination: Path) -> list[dict]:
+    errors = inspect_docx(source)
+    if errors:
+        raise ValueError(" ".join(errors))
     document = Document(source)
     if document.tables:
         raise ValueError("Документы с таблицами пока не поддерживаются.")
@@ -355,6 +392,118 @@ def extract_docx(source: Path, destination: Path) -> list[dict]:
 
 def load_blocks(path: Path) -> list[dict]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _replace_run_text(run, text: str) -> None:
+    text_elements = list(run.iter(f"{{{W}}}t"))
+    if not text_elements:
+        if text:
+            raise ValueError("Структура оформления сноски изменилась.")
+        return
+    text_elements[0].text = text
+    for element in text_elements[1:]:
+        element.text = ""
+
+
+def _rewrite_docx_package(path: Path, replacements: dict[str, bytes]) -> None:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx", dir=path.parent) as temporary:
+        temporary_path = Path(temporary.name)
+    try:
+        with zipfile.ZipFile(path, "r") as source, zipfile.ZipFile(
+            temporary_path, "w", zipfile.ZIP_DEFLATED
+        ) as target:
+            for item in source.infolist():
+                target.writestr(item, replacements.get(item.filename, source.read(item.filename)))
+            for name, content in replacements.items():
+                if name not in source.namelist():
+                    target.writestr(name, content)
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _replace_footnote_text_in_package(path: Path, blocks: list[dict]) -> None:
+    footnote_blocks = [block for block in blocks if block.get("тип") == "сноска"]
+    if not footnote_blocks:
+        return
+    try:
+        with zipfile.ZipFile(path) as archive:
+            root = ElementTree.fromstring(archive.read("word/footnotes.xml"))
+    except (KeyError, zipfile.BadZipFile, ElementTree.ParseError) as error:
+        raise ValueError("Не удалось сохранить текст сносок документа.") from error
+
+    for block in footnote_blocks:
+        match = re.fullmatch(r"F(.+)-P(\d+)", str(block.get("идентификатор", "")))
+        if match is None:
+            raise ValueError("Структура сносок проверенного перевода некорректна.")
+        footnote_id, paragraph_number = match.groups()
+        footnote = root.find(f"./{{{W}}}footnote[@{{{W}}}id='{footnote_id}']")
+        paragraphs = [] if footnote is None else footnote.findall(f"./{{{W}}}p")
+        paragraph_index = int(paragraph_number) - 1
+        if paragraph_index >= len(paragraphs):
+            raise ValueError(f"Структура оформления блока {block['идентификатор']} изменилась.")
+        runs = [
+            run for run in paragraphs[paragraph_index].findall(f"./{{{W}}}r")
+            if _run_footnote_id(run) is None
+        ]
+        fragments = [
+            fragment for fragment in _fragments(block) if fragment.get("сноска") is None
+        ]
+        if len(runs) != len(fragments):
+            raise ValueError(f"Структура оформления блока {block['идентификатор']} изменилась.")
+        for run, fragment in zip(runs, fragments, strict=True):
+            _replace_run_text(run, fragment["текст"])
+    _rewrite_docx_package(
+        path,
+        {"word/footnotes.xml": ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)},
+    )
+
+
+def rebuild_docx(template: Path, translated_blocks: list[dict], destination: Path) -> None:
+    document = Document(template)
+    main_blocks = [block for block in translated_blocks if block.get("тип") != "сноска"]
+    if len(document.paragraphs) != len(main_blocks):
+        raise ValueError("Количество блоков шаблона не совпадает с проверенным переводом.")
+    for paragraph, block in zip(document.paragraphs, main_blocks, strict=True):
+        if block.get("тип") == "разрыв_сцены":
+            continue
+        text_runs = [run for run in paragraph.runs if _run_footnote_id(run) is None]
+        fragments = [
+            fragment for fragment in _fragments(block) if fragment.get("сноска") is None
+        ]
+        if len(text_runs) != len(fragments):
+            raise ValueError(f"Структура оформления блока {block['идентификатор']} изменилась.")
+        for run, fragment in zip(text_runs, fragments, strict=True):
+            run.text = fragment["текст"]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    document.save(destination)
+    try:
+        _replace_footnote_text_in_package(destination, translated_blocks)
+        errors = inspect_docx(destination)
+    except ValueError:
+        destination.unlink(missing_ok=True)
+        raise
+    if errors:
+        destination.unlink(missing_ok=True)
+        raise ValueError(" ".join(errors))
+
+
+def docx_has_footnote_reference(path: Path, footnote_id: str) -> bool:
+    with zipfile.ZipFile(path) as archive:
+        root = ElementTree.fromstring(archive.read("word/document.xml"))
+    return any(
+        reference.get(f"{{{W}}}id") == footnote_id
+        for reference in root.iter(f"{{{W}}}footnoteReference")
+    )
+
+
+def docx_footnote_text(path: Path, footnote_id: str) -> str:
+    with zipfile.ZipFile(path) as archive:
+        root = ElementTree.fromstring(archive.read("word/footnotes.xml"))
+    footnote = root.find(f"./{{{W}}}footnote[@{{{W}}}id='{footnote_id}']")
+    if footnote is None:
+        return ""
+    return "".join(text.text or "" for text in footnote.iter(f"{{{W}}}t"))
 
 
 def _fragments(block: dict) -> list[dict]:
