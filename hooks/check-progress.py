@@ -24,11 +24,7 @@ def find_project(start: Path) -> Path | None:
         for candidate in (current, *current.parents):
             work = candidate / "work"
             active_path = work / "active.json"
-            if (
-                is_unsafe_link(work)
-                or is_unsafe_link(active_path)
-                or active_path.exists()
-            ):
+            if is_unsafe_link(active_path) or active_path.exists():
                 return candidate
     except (OSError, ValueError):
         return None

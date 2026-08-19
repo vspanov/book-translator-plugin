@@ -31,6 +31,10 @@ def make_directory_link(link: Path, target: Path) -> None:
         link.symlink_to(target, target_is_directory=True)
 
 
+def make_file_link(link: Path, target: Path) -> None:
+    link.symlink_to(target)
+
+
 def remove_directory_link(link: Path) -> None:
     link.unlink() if link.is_symlink() else link.rmdir()
 
@@ -467,6 +471,97 @@ class TransactionTests(unittest.TestCase):
                 errors = progress.check_completed_chapter(project, "chapter-1.docx")
 
                 self.assertTrue(errors)
+
+    def test_completed_chapter_rejects_linked_new_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            progress.initialize_project(project)
+            transaction = self.prepare(project)
+            progress.commit_transaction(project, transaction)
+            external = root / "external-output"
+            make_file(external / "chapter-1.docx", b"outside")
+            (transaction / "new-output/chapter-1.docx").unlink()
+            (transaction / "new-output").rmdir()
+            linked = transaction / "new-output"
+            try:
+                make_directory_link(linked, external)
+            except OSError as error:
+                self.skipTest(f"Невозможно создать ссылку: {error}")
+
+            try:
+                errors = progress.check_completed_chapter(project, "chapter-1.docx")
+                self.assertTrue(any("небезопас" in error for error in errors))
+            finally:
+                remove_directory_link(linked)
+
+    def test_completed_chapter_rejects_linked_transaction_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            progress.initialize_project(project)
+            transaction = self.prepare(project)
+            progress.commit_transaction(project, transaction)
+            external = make_file(
+                root / "external-transaction.json",
+                (transaction / "transaction.json").read_bytes(),
+            )
+            metadata = transaction / "transaction.json"
+            metadata.unlink()
+            try:
+                make_file_link(metadata, external)
+            except OSError as error:
+                self.skipTest(f"Невозможно создать ссылку: {error}")
+
+            errors = progress.check_completed_chapter(project, "chapter-1.docx")
+            self.assertTrue(any("небезопас" in error for error in errors))
+
+    def test_completed_chapter_rejects_linked_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            progress.initialize_project(project)
+            transaction = self.prepare(project)
+            progress.commit_transaction(project, transaction)
+            external = make_file(
+                root / "external-checkpoint.json",
+                (transaction / "next-progress.json").read_bytes(),
+            )
+            checkpoint = transaction / "next-progress.json"
+            checkpoint.unlink()
+            try:
+                make_file_link(checkpoint, external)
+            except OSError as error:
+                self.skipTest(f"Невозможно создать ссылку: {error}")
+
+            errors = progress.check_completed_chapter(project, "chapter-1.docx")
+            self.assertTrue(any("небезопас" in error for error in errors))
+
+    def test_commit_rejects_linked_prepared_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            progress.initialize_project(project)
+            transaction = self.prepare(project)
+            external = root / "external-output"
+            make_file(external / "chapter-1.docx", b"outside")
+            (transaction / "new-output/chapter-1.docx").unlink()
+            (transaction / "new-output").rmdir()
+            linked = transaction / "new-output"
+            try:
+                make_directory_link(linked, external)
+            except OSError as error:
+                self.skipTest(f"Невозможно создать ссылку: {error}")
+
+            try:
+                with self.assertRaisesRegex(ValueError, "небезопас"):
+                    progress.commit_transaction(project, transaction)
+            finally:
+                remove_directory_link(linked)
 
     def test_consistency_rejects_truncated_progress(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -96,6 +96,10 @@ def make_file_link(link: Path, target: Path) -> None:
     link.symlink_to(target)
 
 
+def remove_directory_link(link: Path) -> None:
+    link.unlink() if link.is_symlink() else link.rmdir()
+
+
 class StopHookTests(unittest.TestCase):
     def test_allows_ordinary_folder(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -249,6 +253,27 @@ class StopHookTests(unittest.TestCase):
                 self.assertEqual("block", result["decision"])
                 self.assertIn("chapter-1.docx", result["reason"])
 
+    def test_blocks_completion_with_linked_transaction_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            completed_project(project)
+            transaction = next((project / "work/transactions").iterdir())
+            external = root / "external-transaction.json"
+            external.write_bytes((transaction / "transaction.json").read_bytes())
+            metadata = transaction / "transaction.json"
+            metadata.unlink()
+            try:
+                make_file_link(metadata, external)
+            except OSError as error:
+                self.skipTest(f"Невозможно создать ссылку: {error}")
+
+            result = run_hook(project)
+
+            self.assertEqual("block", result["decision"])
+            self.assertIn("небезопас", result["reason"].lower())
+
     def test_rechecks_when_stop_hook_is_already_active(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
@@ -367,6 +392,25 @@ class StopHookTests(unittest.TestCase):
 
             self.assertEqual("block", result["decision"])
             self.assertIn("небезопас", result["reason"].lower())
+
+    def test_allows_unrelated_linked_work_without_active_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            (project / "child").mkdir()
+            external_work = root / "external-work"
+            external_work.mkdir()
+            linked = project / "work"
+            try:
+                make_directory_link(linked, external_work)
+            except OSError as error:
+                self.skipTest(f"Невозможно создать ссылку: {error}")
+
+            try:
+                self.assertEqual(ALLOW, run_hook(project / "child"))
+            finally:
+                remove_directory_link(linked)
 
     def test_blocks_linked_active_marker_before_reading_external_file(self):
         with tempfile.TemporaryDirectory() as directory:

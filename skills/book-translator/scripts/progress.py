@@ -95,6 +95,21 @@ def _transaction_directory(transactions: Path, path: Path) -> Path:
     return transaction
 
 
+def _confined_transaction_child(
+    transaction: Path, name: str, directory: bool = False, required: bool = True
+) -> Path:
+    path = transaction / name
+    if _is_link(path):
+        raise ValueError(f"Путь {name} внутри транзакции небезопасен.")
+    present = path.is_dir() if directory else path.is_file()
+    if (
+        (required and not present)
+        or (path.exists() and (not present or path.resolve().parent != transaction.resolve()))
+    ):
+        raise ValueError(f"Путь {name} внутри транзакции небезопасен.")
+    return path
+
+
 def initialize_project(project_dir: Path) -> None:
     project_dir = project_dir.resolve()
     assets = Path(__file__).resolve().parents[1] / "assets"
@@ -498,15 +513,16 @@ def _transaction_for_project(project_dir: Path, transaction_dir: Path) -> Path:
 
 
 def _validate_prepared(transaction: Path) -> dict:
-    metadata = _load_json(transaction / "transaction.json", "описание транзакции")
+    metadata_path = _confined_transaction_child(transaction, "transaction.json")
+    metadata = _load_json(metadata_path, "описание транзакции")
     chapter_name = _chapter_name(metadata.get("глава"))
-    output = transaction / "new-output" / chapter_name
-    state = transaction / "new-state"
+    new_output = _confined_transaction_child(transaction, "new-output", directory=True)
+    output = _confined_transaction_child(new_output, chapter_name)
+    state = _confined_transaction_child(transaction, "new-state", directory=True)
     _validate_state(state)
-    next_progress = _load_json(
-        transaction / "next-progress.json", "следующую контрольную точку"
-    )
-    if _file_sha256(transaction / "next-progress.json") != metadata.get(
+    checkpoint_path = _confined_transaction_child(transaction, "next-progress.json")
+    next_progress = _load_json(checkpoint_path, "следующую контрольную точку")
+    if _file_sha256(checkpoint_path) != metadata.get(
         "sha256_контрольной_точки"
     ):
         raise ValueError("Подготовленная контрольная точка изменена.")
@@ -519,8 +535,9 @@ def _validate_prepared(transaction: Path) -> dict:
 
 
 def _backup_current(project_dir: Path, transaction: Path) -> None:
-    backup = transaction / "backup"
-    if (backup / "готово").is_file():
+    backup = _confined_transaction_child(transaction, "backup", directory=True)
+    ready = _confined_transaction_child(backup, "готово", required=False)
+    if ready.is_file():
         return
     temporary = transaction / "backup.tmp"
     _remove_within(temporary, transaction)
@@ -571,14 +588,16 @@ def _publish_state(project_dir: Path, transaction: Path, metadata: dict) -> None
         return
     if marker.exists():
         raise ValueError("Опубликованная память не совпадает с транзакцией.")
-    _replace_directory(transaction / "new-state", target, transaction, "память")
+    source = _confined_transaction_child(transaction, "new-state", directory=True)
+    _replace_directory(source, target, transaction, "память")
     _mark_step(transaction, "state")
 
 
 def _publish_output(project_dir: Path, transaction: Path, metadata: dict) -> None:
     marker = transaction / "output"
     chapter_name = metadata["глава"]
-    source = transaction / "new-output" / chapter_name
+    new_output = _confined_transaction_child(transaction, "new-output", directory=True)
+    source = _confined_transaction_child(new_output, chapter_name)
     target = project_dir / "output" / chapter_name
     expected = metadata["sha256_результата"]
     if target.is_file() and _file_sha256(target) == expected:
@@ -598,9 +617,8 @@ def _publish_output(project_dir: Path, transaction: Path, metadata: dict) -> Non
 
 def _publish_progress(project_dir: Path, transaction: Path, metadata: dict) -> None:
     target = project_dir / "progress.json"
-    next_progress = _load_json(
-        transaction / "next-progress.json", "следующую контрольную точку"
-    )
+    checkpoint_path = _confined_transaction_child(transaction, "next-progress.json")
+    next_progress = _load_json(checkpoint_path, "следующую контрольную точку")
     next_progress["sha256_результата"] = metadata["sha256_результата"]
     next_progress["sha256_памяти"] = metadata["sha256_памяти"]
     write_json_atomic(target, next_progress)
@@ -608,9 +626,8 @@ def _publish_progress(project_dir: Path, transaction: Path, metadata: dict) -> N
 
 
 def _restore_backup(project_dir: Path, transaction: Path) -> None:
-    backup = transaction / "backup"
-    if not (backup / "готово").is_file():
-        raise ValueError("Резервная копия транзакции не готова.")
+    backup = _confined_transaction_child(transaction, "backup", directory=True)
+    _confined_transaction_child(backup, "готово")
     for name in ("state", "output"):
         failed = transaction / f"несогласованный-{name}"
         _remove_within(failed, transaction)
@@ -637,9 +654,9 @@ def commit_transaction(
     transaction = _transaction_for_project(project_dir, transaction_dir)
     if interrupt_after not in {None, "state", "output"}:
         raise ValueError("Неизвестная точка прерывания транзакции.")
-    if not (transaction / "готово-к-фиксации").is_file():
-        raise ValueError("Транзакция не готова к фиксации.")
-    if (transaction / "отменено").exists():
+    _confined_transaction_child(transaction, "готово-к-фиксации")
+    cancelled = _confined_transaction_child(transaction, "отменено", required=False)
+    if cancelled.exists():
         raise ValueError("Транзакция отменена после восстановления резервной копии.")
     try:
         metadata = _validate_prepared(transaction)
@@ -659,7 +676,9 @@ def commit_transaction(
             raise ValueError("Контрольная сумма опубликованной памяти не совпала.")
         _write_text_atomic(transaction / "завершено", "да\n")
     except (OSError, ValueError) as error:
-        if (transaction / "backup" / "готово").is_file():
+        backup = _confined_transaction_child(transaction, "backup", directory=True)
+        ready = _confined_transaction_child(backup, "готово", required=False)
+        if ready.is_file():
             _restore_backup(project_dir, transaction)
             raise ValueError(
                 f"Транзакция несогласована; опубликованные данные восстановлены: {error}"
@@ -679,9 +698,18 @@ def recover_transaction(project_dir: Path) -> None:
         if not transaction.is_dir():
             continue
         transaction = _transaction_directory(transactions, transaction)
-        if not (transaction / "готово-к-фиксации").is_file():
+        ready_marker = _confined_transaction_child(
+            transaction, "готово-к-фиксации", required=False
+        )
+        complete_marker = _confined_transaction_child(
+            transaction, "завершено", required=False
+        )
+        cancelled_marker = _confined_transaction_child(
+            transaction, "отменено", required=False
+        )
+        if not ready_marker.is_file():
             _remove_within(transaction, transactions)
-        elif not (transaction / "завершено").is_file() and not (transaction / "отменено").is_file():
+        elif not complete_marker.is_file() and not cancelled_marker.is_file():
             ready.append(transaction)
     if len(ready) > 1:
         raise ValueError("Найдено несколько незавершённых готовых транзакций.")
@@ -711,11 +739,12 @@ def _completed_transaction(project_dir: Path, chapter_name: str) -> Path:
     if not transaction.exists():
         raise ValueError(f"Транзакция главы «{chapter_name}» отсутствует.")
     transaction = _transaction_directory(transactions, transaction)
-    marker = transaction / "завершено"
-    if _is_link(marker) or not marker.is_file():
+    try:
+        _confined_transaction_child(transaction, "завершено")
+    except ValueError as error:
         raise ValueError(
             f"Завершённый маркер транзакции главы «{chapter_name}» отсутствует."
-        )
+        ) from error
     return transaction
 
 
