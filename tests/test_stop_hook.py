@@ -92,6 +92,10 @@ def make_directory_link(link: Path, target: Path) -> None:
         link.symlink_to(target, target_is_directory=True)
 
 
+def make_file_link(link: Path, target: Path) -> None:
+    link.symlink_to(target)
+
+
 class StopHookTests(unittest.TestCase):
     def test_allows_ordinary_folder(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -220,6 +224,31 @@ class StopHookTests(unittest.TestCase):
             self.assertEqual("block", result["decision"])
             self.assertIn("chapter-1.docx", result["reason"])
 
+    def test_blocks_completion_when_earlier_output_or_metadata_is_changed(self):
+        for changed_path in ("output", "metadata"):
+            with self.subTest(changed_path=changed_path), tempfile.TemporaryDirectory() as directory:
+                project = Path(directory)
+                progress.initialize_project(project)
+                progress.start_chapter(project, "chapter-1.docx")
+                first_transaction = commit_chapter(project, "chapter-1.docx")
+                commit_chapter(project, "chapter-2.docx")
+                state = progress.load_progress(project)
+                state.update({"статус_книги": "готово", "необработанных_глав": 0})
+                progress.write_json_atomic(project / "progress.json", state)
+                (project / "work" / "manifest.json").write_text(json.dumps({
+                    "версия": 1,
+                    "главы": [{"имя": "chapter-1.docx"}, {"имя": "chapter-2.docx"}],
+                }, ensure_ascii=False), encoding="utf-8")
+                if changed_path == "output":
+                    (project / "output" / "chapter-1.docx").write_bytes(b"changed")
+                else:
+                    (first_transaction / "transaction.json").write_text("{}", encoding="utf-8")
+
+                result = run_hook(project)
+
+                self.assertEqual("block", result["decision"])
+                self.assertIn("chapter-1.docx", result["reason"])
+
     def test_rechecks_when_stop_hook_is_already_active(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
@@ -305,6 +334,58 @@ class StopHookTests(unittest.TestCase):
             shutil.rmtree(project / "work")
             try:
                 make_directory_link(project / "work", external_work)
+            except OSError as error:
+                self.skipTest(f"Невозможно создать ссылку: {error}")
+
+            result = run_hook(project)
+
+            self.assertEqual("block", result["decision"])
+            self.assertIn("небезопас", result["reason"].lower())
+
+    def test_blocks_cwd_inside_linked_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            activate(project, {
+                "статус_книги": "ошибка",
+                "этап": "проверка_2",
+                "текущая_глава": "chapter-1.docx",
+                "ошибка": "Критический пропуск зафиксирован для исправления.",
+                "необработанных_глав": 1,
+            })
+            external_work = root / "external-work"
+            (external_work / "chapter-1").mkdir(parents=True)
+            (external_work / "active.json").write_text("{}", encoding="utf-8")
+            shutil.rmtree(project / "work")
+            try:
+                make_directory_link(project / "work", external_work)
+            except OSError as error:
+                self.skipTest(f"Невозможно создать ссылку: {error}")
+
+            result = run_hook(project / "work" / "chapter-1")
+
+            self.assertEqual("block", result["decision"])
+            self.assertIn("небезопас", result["reason"].lower())
+
+    def test_blocks_linked_active_marker_before_reading_external_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            activate(project, {
+                "статус_книги": "ошибка",
+                "этап": "проверка_2",
+                "текущая_глава": "chapter-1.docx",
+                "ошибка": "Критический пропуск зафиксирован для исправления.",
+                "необработанных_глав": 1,
+            })
+            external_marker = root / "external-active.json"
+            external_marker.write_text("{}", encoding="utf-8")
+            marker = project / "work" / "active.json"
+            marker.unlink()
+            try:
+                make_file_link(marker, external_marker)
             except OSError as error:
                 self.skipTest(f"Невозможно создать ссылку: {error}")
 

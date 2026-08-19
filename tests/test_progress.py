@@ -452,6 +452,22 @@ class TransactionTests(unittest.TestCase):
             self.assertTrue(any("результат" in error for error in errors))
             self.assertTrue(any("памят" in error for error in errors))
 
+    def test_completed_chapter_check_detects_output_or_transaction_changes(self):
+        for changed_path in ("output", "transaction"):
+            with self.subTest(changed_path=changed_path), tempfile.TemporaryDirectory() as directory:
+                project = Path(directory)
+                progress.initialize_project(project)
+                transaction = self.prepare(project)
+                progress.commit_transaction(project, transaction)
+                if changed_path == "output":
+                    (project / "output/chapter-1.docx").write_bytes(b"changed")
+                else:
+                    (transaction / "transaction.json").write_text("{}", encoding="utf-8")
+
+                errors = progress.check_completed_chapter(project, "chapter-1.docx")
+
+                self.assertTrue(errors)
+
     def test_consistency_rejects_truncated_progress(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)

@@ -49,7 +49,7 @@ BOOK_STATUSES = {"не_начат", "в_работе", "ошибка", "гото
 KNOWN_STAGES = {None, "ожидает_извлечения", *STAGE_AFTER, *STAGE_AFTER.values()}
 
 
-def _is_link(path: Path) -> bool:
+def is_unsafe_link(path: Path) -> bool:
     try:
         attributes = getattr(path.lstat(), "st_file_attributes", 0)
     except OSError:
@@ -57,6 +57,9 @@ def _is_link(path: Path) -> bool:
     return path.is_symlink() or bool(
         attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     )
+
+
+_is_link = is_unsafe_link
 
 
 def _project_directory(project_dir: Path, name: str) -> Path:
@@ -716,6 +719,22 @@ def _completed_transaction(project_dir: Path, chapter_name: str) -> Path:
     return transaction
 
 
+def check_completed_chapter(project_dir: Path, chapter_name: str) -> list[str]:
+    project_dir = project_dir.resolve()
+    try:
+        chapter_name = _chapter_name(chapter_name)
+        output = _published_output(project_dir, chapter_name)
+        transaction = _completed_transaction(project_dir, chapter_name)
+        metadata = _validate_prepared(transaction)
+    except (OSError, ValueError) as error:
+        return [str(error)]
+    if metadata.get("глава") != chapter_name:
+        return [f"Описание транзакции не относится к главе «{chapter_name}»."]
+    if _file_sha256(output) != metadata.get("sha256_результата"):
+        return [f"Контрольная сумма опубликованного результата главы «{chapter_name}» не совпадает."]
+    return []
+
+
 def check_consistency(project_dir: Path) -> list[str]:
     project_dir = project_dir.resolve()
     try:
@@ -735,14 +754,13 @@ def check_consistency(project_dir: Path) -> list[str]:
             chapter_name = _chapter_name(chapter_name)
         except ValueError as error:
             return [str(error)]
-        try:
+        chapter_errors = check_completed_chapter(project_dir, chapter_name)
+        errors.extend(chapter_errors)
+        if not chapter_errors:
             output = _published_output(project_dir, chapter_name)
-        except ValueError as error:
-            errors.append(str(error))
-            output = None
-        expected_output = state.get("sha256_результата")
-        if output is not None and _file_sha256(output) != expected_output:
-            errors.append("Контрольная сумма опубликованного результата не совпадает.")
+            expected_output = state.get("sha256_результата")
+            if _file_sha256(output) != expected_output:
+                errors.append("Контрольная сумма опубликованного результата не совпадает.")
         expected_state = state.get("sha256_памяти")
         try:
             actual_state = directory_sha256(project_dir / "state")
@@ -751,10 +769,6 @@ def check_consistency(project_dir: Path) -> list[str]:
         else:
             if actual_state != expected_state:
                 errors.append("Контрольная сумма памяти не совпадает.")
-        try:
-            _completed_transaction(project_dir, chapter_name)
-        except ValueError as error:
-            errors.append(str(error))
     return errors
 
 
@@ -782,11 +796,9 @@ def finish_book(project_dir: Path) -> None:
         if not names or last_ready not in names or names[-1] != last_ready:
             raise ValueError("В книге остались необработанные главы.")
         for chapter_name in names:
-            try:
-                _published_output(project_dir, chapter_name)
-                _completed_transaction(project_dir, chapter_name)
-            except ValueError as error:
-                raise ValueError(f"Глава «{chapter_name}» не готова: {error}") from error
+            errors = check_completed_chapter(project_dir, chapter_name)
+            if errors:
+                raise ValueError(f"Глава «{chapter_name}» не готова: {' '.join(errors)}")
     errors = check_consistency(project_dir)
     if errors:
         raise ValueError("Проект несогласован: " + " ".join(errors))

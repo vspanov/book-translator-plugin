@@ -12,7 +12,7 @@ sys.stdin.reconfigure(encoding="utf-8")
 sys.stdout.reconfigure(encoding="utf-8")
 PLUGIN_ROOT = Path(os.environ.get("PLUGIN_ROOT", Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(PLUGIN_ROOT / "skills" / "book-translator" / "scripts"))
-from progress import _completed_transaction, _is_link, _published_output, check_consistency
+from progress import check_completed_chapter, check_consistency, is_unsafe_link
 
 
 ALLOW = {"continue": True, "suppressOutput": True}
@@ -20,9 +20,15 @@ ALLOW = {"continue": True, "suppressOutput": True}
 
 def find_project(start: Path) -> Path | None:
     try:
-        current = start.resolve()
+        current = Path(os.path.abspath(start))
         for candidate in (current, *current.parents):
-            if (candidate / "work" / "active.json").is_file():
+            work = candidate / "work"
+            active_path = work / "active.json"
+            if (
+                is_unsafe_link(work)
+                or is_unsafe_link(active_path)
+                or active_path.exists()
+            ):
                 return candidate
     except (OSError, ValueError):
         return None
@@ -51,11 +57,9 @@ def completion_error(project: Path, state: dict) -> str | None:
     if not names or state.get("последняя_готовая_глава") != names[-1]:
         return "Завершение не согласовано: в очереди остались главы."
     for chapter_name in names:
-        try:
-            _published_output(project, chapter_name)
-            _completed_transaction(project, chapter_name)
-        except (OSError, ValueError) as error:
-            return f"Завершение не согласовано: глава «{chapter_name}» не готова: {error}"
+        errors = check_completed_chapter(project, chapter_name)
+        if errors:
+            return f"Завершение не согласовано: глава «{chapter_name}» не готова: {' '.join(errors)}"
     return None
 
 
@@ -67,10 +71,10 @@ def evaluate(event: dict) -> dict:
 
     work = project / "work"
     active_path = work / "active.json"
-    if _is_link(work) or not work.is_dir() or work.resolve().parent != project:
+    if is_unsafe_link(work) or not work.is_dir() or work.resolve().parent != project.resolve():
         return block("Путь work/ активного перевода небезопасен.")
     if (
-        _is_link(active_path)
+        is_unsafe_link(active_path)
         or not active_path.is_file()
         or active_path.resolve().parent != work.resolve()
     ):
