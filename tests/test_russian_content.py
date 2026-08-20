@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CYRILLIC = re.compile(r"[А-Яа-яЁё]")
 LETTERS = re.compile(r"[А-Яа-яЁёA-Za-z]")
 FORBIDDEN_BOOK_TERMS = re.compile(
-    r"илиш|elish|магнус|magnus|дрейк|drake|кел|kel|джейд|jade|силас|silas|coke",
+    r"(?<![A-Za-zА-Яа-яЁё])(?:илиш|elish|магнус|magnus|дрейк|drake|кел|kel|джейд|jade|силас|silas|coke)(?![A-Za-zА-Яа-яЁё])",
     re.IGNORECASE,
 )
 TECHNICAL_IDENTIFIERS = re.compile(
@@ -120,6 +120,15 @@ class RussianContentTests(unittest.TestCase):
         for path in files:
             with self.subTest(path=path):
                 self.assertNotRegex(path.read_text(encoding="utf-8"), FORBIDDEN_BOOK_TERMS)
+
+    def test_forbidden_terms_match_whole_names_but_not_word_parts(self):
+        """Ловит запрет обычных слов, в которых случайно есть часть старого имени."""
+        for text in ("A jaded narrator.", "скелет"):
+            with self.subTest(text=text):
+                self.assertIsNone(FORBIDDEN_BOOK_TERMS.search(text))
+        for text in ("Jade", "Кел", "Магнус", "coke"):
+            with self.subTest(text=text):
+                self.assertIsNotNone(FORBIDDEN_BOOK_TERMS.search(text))
 
 
 if __name__ == "__main__":
