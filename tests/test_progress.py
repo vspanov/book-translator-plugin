@@ -256,6 +256,28 @@ class StageMachineTests(unittest.TestCase):
 
                 self.assertEqual("не_начат", progress.load_progress(project)["статус_книги"])
 
+    def test_first_start_recovery_rejects_marker_without_project_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            progress.initialize_project(project)
+            self.write_manifest(project, "chapter-1.docx")
+            marker_path = project / "work/active.json"
+            marker_path.write_text(
+                json.dumps(
+                    {"проект": str(project.resolve()), "глава": "chapter-1.docx"},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            marker_before = marker_path.read_bytes()
+            progress_before = (project / "progress.json").read_bytes()
+
+            with self.assertRaisesRegex(ValueError, "маркер|Маркер|принадлеж"):
+                progress.start_chapter(project, "chapter-1.docx")
+
+            self.assertEqual(marker_before, marker_path.read_bytes())
+            self.assertEqual(progress_before, (project / "progress.json").read_bytes())
+
     def test_stage_cannot_be_skipped_repeated_or_unknown(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
@@ -417,6 +439,149 @@ class TransactionTests(unittest.TestCase):
                 self.assertEqual(b"result", (project / "output" / result_name).read_bytes())
                 self.assertEqual(chapter_name, progress.load_progress(project)["последняя_готовая_глава"])
                 self.assertEqual([], progress.check_completed_chapter(project, chapter_name))
+
+    def test_pages_package_survives_commit_recovery_check_and_finish(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            progress.initialize_project(project)
+            progress.write_json_atomic(
+                project / "work/manifest.json",
+                {"версия": 1, "главы": [{"имя": "chapter-1.docx"}]},
+            )
+            progress.start_chapter(project, "chapter-1.docx")
+            package = project / "work/chapter-1.pages"
+            make_file(package / "Index.zip", b"pages package")
+            transaction = progress.prepare_transaction(
+                project,
+                chapter_name="chapter-1.docx",
+                built_document=package,
+                next_state=make_state_directory(project / "work/next-state"),
+                next_progress=ready_progress("chapter-1.docx"),
+            )
+
+            progress.commit_transaction(project, transaction, interrupt_after="output")
+            progress.recover_transaction(project)
+
+            published = project / "output/chapter-1.pages"
+            self.assertTrue(published.is_dir())
+            self.assertEqual(b"pages package", (published / "Index.zip").read_bytes())
+            self.assertEqual([], progress.check_completed_chapter(project, "chapter-1.docx"))
+            progress.finish_book(project)
+            self.assertEqual("готово", progress.load_progress(project)["статус_книги"])
+            self.assertEqual(b"pages package", (published / "Index.zip").read_bytes())
+
+    def test_pages_package_rejects_internal_directory_link_before_staging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            progress.initialize_project(project)
+            package = project / "work/chapter-1.pages"
+            make_file(package / "Index.zip", b"pages package")
+            external = project / "input"
+            sentinel = make_file(external / "original.docx", b"original")
+            linked = package / "external"
+            make_directory_link(linked, external)
+            try:
+                with self.assertRaisesRegex(ValueError, "ссыл|Ссыл|небезопас"):
+                    progress.prepare_transaction(
+                        project,
+                        chapter_name="chapter-1.docx",
+                        built_document=package,
+                        next_state=make_state_directory(project / "work/next-state"),
+                        next_progress=ready_progress("chapter-1.docx"),
+                    )
+                self.assertEqual(b"original", sentinel.read_bytes())
+                self.assertFalse((project / "work/transactions").exists())
+            finally:
+                if linked.exists():
+                    remove_directory_link(linked)
+
+    def test_completed_pages_package_detects_content_tampering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            progress.initialize_project(project)
+            package = project / "work/chapter-1.pages"
+            make_file(package / "Index.zip", b"pages package")
+            transaction = progress.prepare_transaction(
+                project,
+                chapter_name="chapter-1.docx",
+                built_document=package,
+                next_state=make_state_directory(project / "work/next-state"),
+                next_progress=ready_progress("chapter-1.docx"),
+            )
+            progress.commit_transaction(project, transaction)
+
+            (project / "output/chapter-1.pages/Index.zip").write_bytes(b"tampered")
+
+            errors = progress.check_completed_chapter(project, "chapter-1.docx")
+            self.assertTrue(any("сумм" in error.lower() for error in errors))
+
+    def test_completed_pages_package_reports_internal_directory_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            progress.initialize_project(project)
+            package = project / "work/chapter-1.pages"
+            make_file(package / "Index.zip", b"pages package")
+            transaction = progress.prepare_transaction(
+                project,
+                chapter_name="chapter-1.docx",
+                built_document=package,
+                next_state=make_state_directory(project / "work/next-state"),
+                next_progress=ready_progress("chapter-1.docx"),
+            )
+            progress.commit_transaction(project, transaction)
+            external = project / "input"
+            make_file(external / "original.docx", b"original")
+            linked = project / "output/chapter-1.pages/external"
+            make_directory_link(linked, external)
+            try:
+                errors = progress.check_completed_chapter(project, "chapter-1.docx")
+                self.assertTrue(any("ссыл" in error.lower() for error in errors))
+            finally:
+                if linked.exists():
+                    remove_directory_link(linked)
+
+    def test_pages_package_is_removed_when_interrupted_transaction_rolls_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            progress.initialize_project(project)
+            old_progress = (project / "progress.json").read_bytes()
+            old_state = progress.directory_sha256(project / "state")
+            existing = make_file(project / "output/existing.docx", b"existing")
+            package = project / "work/chapter-1.pages"
+            make_file(package / "Index.zip", b"pages package")
+            transaction = progress.prepare_transaction(
+                project,
+                chapter_name="chapter-1.docx",
+                built_document=package,
+                next_state=make_state_directory(project / "work/next-state"),
+                next_progress=ready_progress("chapter-1.docx"),
+            )
+            progress.commit_transaction(project, transaction, interrupt_after="output")
+            (transaction / "next-progress.json").write_bytes(b"{}")
+
+            with self.assertRaisesRegex(ValueError, "восстанов"):
+                progress.commit_transaction(project, transaction)
+
+            self.assertFalse((project / "output/chapter-1.pages").exists())
+            self.assertEqual(b"existing", existing.read_bytes())
+            self.assertEqual(old_progress, (project / "progress.json").read_bytes())
+            self.assertEqual(old_state, progress.directory_sha256(project / "state"))
+
+    def test_prepare_rejects_directory_result_without_pages_suffix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            progress.initialize_project(project)
+            directory_result = project / "work/chapter-1.docx"
+            make_file(directory_result / "content.bin", b"not a docx file")
+
+            with self.assertRaisesRegex(ValueError, "документ|результат|Pages"):
+                progress.prepare_transaction(
+                    project,
+                    chapter_name="chapter-1.docx",
+                    built_document=directory_result,
+                    next_state=make_state_directory(project / "work/next-state"),
+                    next_progress=ready_progress("chapter-1.docx"),
+                )
 
     def test_prepare_accepts_only_a_safe_explicit_result_name(self):
         with tempfile.TemporaryDirectory() as directory:

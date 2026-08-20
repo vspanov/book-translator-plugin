@@ -276,6 +276,8 @@ def start_chapter(project_dir: Path, chapter_name: str) -> None:
         raise ValueError("Маркер активной главы небезопасен.")
     if active_path.exists():
         active = _load_json(active_path, "маркер активной главы")
+        if not has_project_identity(active):
+            raise ValueError("Маркер активной главы не принадлежит book-translator.")
         if active.get("проект") != str(project_dir):
             raise ValueError("Маркер активной главы относится к другому проекту.")
         try:
@@ -416,6 +418,46 @@ def directory_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _result_kind(path: Path, result_name: str) -> str:
+    if _is_link(path):
+        raise ValueError("Собранный результат не должен быть ссылкой.")
+    if path.is_file():
+        return "файл"
+    if (
+        path.is_dir()
+        and path.suffix.casefold() == ".pages"
+        and Path(result_name).suffix.casefold() == ".pages"
+    ):
+        directory_sha256(path)
+        if not any(item.is_file() for item in path.rglob("*")):
+            raise ValueError("Собранный пакет Pages пуст.")
+        return "пакет_pages"
+    raise ValueError(
+        "Собранный документ должен быть файлом либо непустым пакетом .pages внутри work/."
+    )
+
+
+def _result_sha256(path: Path, result_kind: str) -> str:
+    if result_kind == "файл":
+        if _is_link(path) or not path.is_file():
+            raise ValueError("Файл результата отсутствует или небезопасен.")
+        return _file_sha256(path)
+    if result_kind == "пакет_pages":
+        if _is_link(path) or not path.is_dir():
+            raise ValueError("Пакет Pages отсутствует или небезопасен.")
+        return directory_sha256(path)
+    raise ValueError("Неизвестный тип собранного результата.")
+
+
+def _copy_result(source: Path, target: Path, result_kind: str) -> None:
+    if result_kind == "файл":
+        shutil.copy2(source, target)
+    elif result_kind == "пакет_pages":
+        shutil.copytree(source, target)
+    else:
+        raise ValueError("Неизвестный тип собранного результата.")
+
+
 def _inside(path: Path, parent: Path) -> bool:
     try:
         path.resolve().relative_to(parent.resolve())
@@ -545,14 +587,16 @@ def prepare_transaction(
 ) -> Path:
     project_dir = project_dir.resolve()
     chapter_name = _chapter_name(chapter_name)
-    built_document = built_document.resolve()
     result_name = _result_name(built_document.name if result_name is None else result_name)
+    built_document = Path(os.path.abspath(built_document))
     next_state = next_state.resolve()
     work_dir = _project_directory(project_dir, "work")
-    if not _inside(built_document, work_dir) or not built_document.is_file():
-        raise ValueError("Собранный документ должен быть файлом внутри work/.")
-    if built_document.stat().st_size == 0:
+    if not _inside(built_document, work_dir):
+        raise ValueError("Собранный документ должен находиться внутри work/.")
+    result_kind = _result_kind(built_document, result_name)
+    if result_kind == "файл" and built_document.stat().st_size == 0:
         raise ValueError("Собранный документ пуст.")
+    result_hash = _result_sha256(built_document, result_kind)
     if not _inside(next_state, work_dir):
         raise ValueError("Следующая версия памяти должна находиться внутри work/.")
     _validate_state(next_state)
@@ -570,7 +614,7 @@ def prepare_transaction(
     state_source = transaction / "new-state"
     (transaction / "new-output").mkdir()
     (transaction / "backup").mkdir()
-    shutil.copy2(built_document, output_source)
+    _copy_result(built_document, output_source, result_kind)
     shutil.copytree(next_state, state_source)
     write_json_atomic(transaction / "next-progress.json", dict(next_progress))
     checkpoint_hash = _file_sha256(transaction / "next-progress.json")
@@ -579,7 +623,8 @@ def prepare_transaction(
         {
             "исходная_глава": chapter_name,
             "имя_результата": result_name,
-            "sha256_результата": _file_sha256(output_source),
+            "тип_результата": result_kind,
+            "sha256_результата": result_hash,
             "sha256_памяти": directory_sha256(state_source),
             "sha256_контрольной_точки": checkpoint_hash,
         },
@@ -601,8 +646,15 @@ def _validate_prepared(transaction: Path) -> dict:
     metadata = _load_json(metadata_path, "описание транзакции")
     chapter_name = _chapter_name(metadata.get("исходная_глава", metadata.get("глава")))
     result_name = _result_name(metadata.get("имя_результата", chapter_name))
+    result_kind = metadata.get("тип_результата", "файл")
+    if result_kind not in {"файл", "пакет_pages"}:
+        raise ValueError("Описание транзакции содержит неизвестный тип результата.")
+    if result_kind == "пакет_pages" and Path(result_name).suffix.casefold() != ".pages":
+        raise ValueError("Пакет Pages должен публиковаться с расширением .pages.")
     new_output = _confined_transaction_child(transaction, "new-output", directory=True)
-    output = _confined_transaction_child(new_output, result_name)
+    output = new_output / result_name
+    if _is_link(output) or output.resolve().parent != new_output.resolve():
+        raise ValueError("Подготовленный результат небезопасен.")
     state = _confined_transaction_child(transaction, "new-state", directory=True)
     _validate_state(state)
     checkpoint_path = _confined_transaction_child(transaction, "next-progress.json")
@@ -612,12 +664,18 @@ def _validate_prepared(transaction: Path) -> dict:
     ):
         raise ValueError("Подготовленная контрольная точка изменена.")
     _validate_next_progress(next_progress, chapter_name)
-    if not output.is_file() or _file_sha256(output) != metadata.get("sha256_результата"):
+    if _result_sha256(output, result_kind) != metadata.get("sha256_результата"):
         raise ValueError("Подготовленный результат повреждён.")
     if directory_sha256(state) != metadata.get("sha256_памяти"):
         raise ValueError("Подготовленная память повреждена.")
     metadata = dict(metadata)
-    metadata.update({"исходная_глава": chapter_name, "имя_результата": result_name})
+    metadata.update(
+        {
+            "исходная_глава": chapter_name,
+            "имя_результата": result_name,
+            "тип_результата": result_kind,
+        }
+    )
     return metadata
 
 
@@ -683,20 +741,31 @@ def _publish_state(project_dir: Path, transaction: Path, metadata: dict) -> None
 def _publish_output(project_dir: Path, transaction: Path, metadata: dict) -> None:
     marker = transaction / "output"
     result_name = metadata["имя_результата"]
+    result_kind = metadata["тип_результата"]
     new_output = _confined_transaction_child(transaction, "new-output", directory=True)
-    source = _confined_transaction_child(new_output, result_name)
+    source = new_output / result_name
     target = project_dir / "output" / result_name
     expected = metadata["sha256_результата"]
-    if target.is_file() and _file_sha256(target) == expected:
+    if _is_link(target):
+        raise ValueError("Путь опубликованного результата небезопасен.")
+    target_matches = False
+    if target.exists():
+        try:
+            target_matches = _result_sha256(target, result_kind) == expected
+        except ValueError:
+            target_matches = False
+    if target_matches:
         if not marker.exists():
             _mark_step(transaction, "output")
         return
     if marker.exists():
         raise ValueError("Опубликованный результат не совпадает с транзакцией.")
+    if target.exists():
+        raise ValueError("Путь публикации уже занят другим результатом.")
     temporary = target.parent / f".{result_name}-{transaction.name}.tmp"
     _remove_within(temporary, target.parent)
-    shutil.copy2(source, temporary)
-    if _file_sha256(temporary) != expected:
+    _copy_result(source, temporary, result_kind)
+    if _result_sha256(temporary, result_kind) != expected:
         raise ValueError("Не удалось проверить временную копию результата.")
     temporary.replace(target)
     _mark_step(transaction, "output")
@@ -755,9 +824,12 @@ def commit_transaction(
         if interrupt_after == "output":
             return
         _publish_progress(project_dir, transaction, metadata)
-        if _file_sha256(project_dir / "output" / metadata["имя_результата"]) != metadata[
-            "sha256_результата"
-        ]:
+        published = _published_output(
+            project_dir,
+            metadata["имя_результата"],
+            metadata["тип_результата"],
+        )
+        if _result_sha256(published, metadata["тип_результата"]) != metadata["sha256_результата"]:
             raise ValueError("Контрольная сумма опубликованного результата не совпала.")
         if directory_sha256(project_dir / "state") != metadata["sha256_памяти"]:
             raise ValueError("Контрольная сумма опубликованной памяти не совпала.")
@@ -804,13 +876,17 @@ def recover_transaction(project_dir: Path) -> None:
         commit_transaction(project_dir, ready[0])
 
 
-def _published_output(project_dir: Path, result_name: str) -> Path:
+def _published_output(
+    project_dir: Path, result_name: str, result_kind: str = "файл"
+) -> Path:
     output = _project_directory(project_dir, "output")
     result_name = _result_name(result_name)
     result = output / result_name
     if (
         _is_link(result)
-        or not result.is_file()
+        or (result_kind == "файл" and not result.is_file())
+        or (result_kind == "пакет_pages" and not result.is_dir())
+        or result_kind not in {"файл", "пакет_pages"}
         or result.resolve().parent != output.resolve()
     ):
         raise ValueError(
@@ -842,12 +918,17 @@ def check_completed_chapter(project_dir: Path, chapter_name: str) -> list[str]:
         chapter_name = _chapter_name(chapter_name)
         transaction = _completed_transaction(project_dir, chapter_name)
         metadata = _validate_prepared(transaction)
-        output = _published_output(project_dir, metadata["имя_результата"])
+        output = _published_output(
+            project_dir,
+            metadata["имя_результата"],
+            metadata["тип_результата"],
+        )
+        actual_hash = _result_sha256(output, metadata["тип_результата"])
     except (OSError, ValueError) as error:
         return [str(error)]
     if metadata.get("исходная_глава") != chapter_name:
         return [f"Описание транзакции не относится к главе «{chapter_name}»."]
-    if _file_sha256(output) != metadata.get("sha256_результата"):
+    if actual_hash != metadata.get("sha256_результата"):
         return [f"Контрольная сумма опубликованного результата главы «{chapter_name}» не совпадает."]
     return []
 
@@ -876,9 +957,13 @@ def check_consistency(project_dir: Path) -> list[str]:
         if not chapter_errors:
             transaction = _completed_transaction(project_dir, chapter_name)
             metadata = _validate_prepared(transaction)
-            output = _published_output(project_dir, metadata["имя_результата"])
+            output = _published_output(
+                project_dir,
+                metadata["имя_результата"],
+                metadata["тип_результата"],
+            )
             expected_output = state.get("sha256_результата")
-            if _file_sha256(output) != expected_output:
+            if _result_sha256(output, metadata["тип_результата"]) != expected_output:
                 errors.append("Контрольная сумма опубликованного результата не совпадает.")
         expected_state = state.get("sha256_памяти")
         try:
