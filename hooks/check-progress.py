@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+
+sys.dont_write_bytecode = True
+sys.stdin.reconfigure(encoding="utf-8")
+sys.stdout.reconfigure(encoding="utf-8")
+PLUGIN_ROOT = Path(os.environ.get("PLUGIN_ROOT", Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(PLUGIN_ROOT / "skills" / "book-translator" / "scripts"))
+from progress import (
+    PROJECT_MARKER_NAME,
+    check_completed_chapter,
+    check_consistency,
+    has_project_identity,
+    is_unsafe_link,
+)
+
+
+ALLOW = {"continue": True, "suppressOutput": True}
+
+
+def safe_identity(path: Path, parent: Path) -> bool:
+    if (
+        is_unsafe_link(parent)
+        or not parent.is_dir()
+        or is_unsafe_link(path)
+        or not path.is_file()
+        or path.resolve().parent != parent.resolve()
+    ):
+        return False
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return has_project_identity(value)
+
+
+def find_project(start: Path) -> Path | None:
+    try:
+        current = Path(os.path.abspath(start))
+        for candidate in (current, *current.parents):
+            work = candidate / "work"
+            active_path = work / "active.json"
+            active_exists = is_unsafe_link(active_path) or active_path.exists()
+            if is_unsafe_link(work) and active_exists:
+                return candidate
+            if active_exists and (
+                safe_identity(active_path, work)
+                or safe_identity(work / PROJECT_MARKER_NAME, work)
+            ):
+                return candidate
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def block(reason: str) -> dict:
+    return {"decision": "block", "reason": reason}
+
+
+def completion_error(project: Path, state: dict) -> str | None:
+    manifest_path = project / "work" / "manifest.json"
+    if not manifest_path.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return "Завершение не согласовано: не удалось прочитать манифест глав."
+    chapters = manifest.get("главы") if isinstance(manifest, dict) else None
+    if not isinstance(chapters, list) or any(
+        not isinstance(chapter, dict) or not isinstance(chapter.get("имя"), str)
+        for chapter in chapters
+    ):
+        return "Завершение не согласовано: манифест глав некорректен."
+    names = [chapter["имя"] for chapter in chapters]
+    if not names or state.get("последняя_готовая_глава") != names[-1]:
+        return "Завершение не согласовано: в очереди остались главы."
+    for chapter_name in names:
+        errors = check_completed_chapter(project, chapter_name)
+        if errors:
+            return f"Завершение не согласовано: глава «{chapter_name}» не готова: {' '.join(errors)}"
+    return None
+
+
+def evaluate(event: dict) -> dict:
+    cwd = event.get("cwd") if isinstance(event.get("cwd"), str) else Path.cwd()
+    project = find_project(Path(cwd))
+    if project is None:
+        return ALLOW
+
+    work = project / "work"
+    active_path = work / "active.json"
+    if is_unsafe_link(work) or not work.is_dir() or work.resolve().parent != project.resolve():
+        return block("Путь work/ активного перевода небезопасен.")
+    if (
+        is_unsafe_link(active_path)
+        or not active_path.is_file()
+        or active_path.resolve().parent != work.resolve()
+    ):
+        return block("Маркер активного перевода небезопасен.")
+    try:
+        marker = json.loads(active_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return block("Не удалось прочитать маркер активного перевода.")
+    if not isinstance(marker, dict):
+        return block("Маркер активного перевода должен содержать объект.")
+    if not has_project_identity(marker):
+        return block("Маркер активного перевода не подтверждает принадлежность book-translator.")
+    if marker.get("проект") != str(project.resolve()):
+        return block("Маркер активного перевода относится к другому проекту.")
+
+    progress_path = project / "progress.json"
+    if (
+        is_unsafe_link(progress_path)
+        or not progress_path.is_file()
+        or progress_path.resolve().parent != project.resolve()
+    ):
+        return block("Путь progress.json активного перевода небезопасен.")
+    try:
+        state = json.loads(progress_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return block("Не удалось прочитать progress.json активного перевода.")
+    if not isinstance(state, dict):
+        return block("progress.json активного перевода должен содержать объект.")
+
+    if state.get("статус_книги") == "ошибка":
+        if isinstance(state.get("ошибка"), str) and state["ошибка"].strip():
+            return ALLOW
+        return block("Ошибка активного перевода не содержит объяснения.")
+
+    if state.get("статус_книги") == "готово":
+        if type(state.get("необработанных_глав")) is not int or state["необработанных_глав"] != 0:
+            return block("Завершение не согласовано: очередь глав не пуста.")
+        error = completion_error(project, state)
+        if error:
+            return block(error)
+        try:
+            errors = check_consistency(project)
+        except Exception:
+            return block("Завершение не согласовано: не удалось проверить состояние проекта.")
+        if errors:
+            return block("Завершение не согласовано: " + " ".join(errors))
+        return ALLOW
+
+    chapter = state.get("текущая_глава") or "неизвестная глава"
+    stage = state.get("этап") or "неизвестный этап"
+    return block(
+        f"Перевод нельзя завершить: {chapter} остановлена на этапе {stage}. "
+        "Продолжи обязательный этап либо запиши объяснённую критическую ошибку."
+    )
+
+
+def main() -> None:
+    try:
+        event = json.load(sys.stdin)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        event = {}
+    try:
+        result = evaluate(event if isinstance(event, dict) else {})
+    except Exception:
+        cwd = event.get("cwd") if isinstance(event, dict) and isinstance(event.get("cwd"), str) else Path.cwd()
+        result = (
+            block("Не удалось проверить активный перевод.")
+            if find_project(Path(cwd)) is not None
+            else ALLOW
+        )
+    json.dump(result, sys.stdout, ensure_ascii=False)
+
+
+if __name__ == "__main__":
+    main()
