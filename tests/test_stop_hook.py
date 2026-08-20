@@ -124,6 +124,29 @@ class StopHookTests(unittest.TestCase):
 
             self.assertEqual(ALLOW, run_hook(project))
 
+    def test_blocks_boolean_and_float_active_identity_versions_in_known_project(self):
+        for invalid_version in (True, 1.0):
+            with self.subTest(version=invalid_version), tempfile.TemporaryDirectory() as directory:
+                project = Path(directory)
+                activate(project, {
+                    "статус_книги": "ошибка",
+                    "этап": "проверка_2",
+                    "текущая_глава": "chapter-1.docx",
+                    "ошибка": "Объяснённая критическая ошибка.",
+                    "необработанных_глав": 1,
+                })
+                active_path = project / "work/active.json"
+                active = json.loads(active_path.read_text(encoding="utf-8"))
+                active["версия"] = invalid_version
+                active_path.write_text(
+                    json.dumps(active, ensure_ascii=False), encoding="utf-8"
+                )
+
+                result = run_hook(project)
+
+                self.assertEqual("block", result["decision"])
+                self.assertIn("принадлеж", result["reason"].lower())
+
     def test_initialized_project_blocks_at_intermediate_stage(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)

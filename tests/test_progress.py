@@ -85,6 +85,26 @@ class ProjectInitializationTests(unittest.TestCase):
             progress.initialize_project(project)
             self.assertEqual("МОЙ ВАРИАНТ", existing.read_text(encoding="utf-8"))
 
+    def test_initialize_project_rejects_boolean_and_float_identity_versions(self):
+        for invalid_version in (True, 1.0):
+            with self.subTest(version=invalid_version), tempfile.TemporaryDirectory() as directory:
+                project = Path(directory)
+                marker = project / "work/book-translator.json"
+                marker.parent.mkdir()
+                marker.write_text(
+                    json.dumps(
+                        {"тип": "book-translator", "версия": invalid_version},
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                marker_before = marker.read_bytes()
+
+                with self.assertRaisesRegex(ValueError, "не принадлежит"):
+                    progress.initialize_project(project)
+
+                self.assertEqual(marker_before, marker.read_bytes())
+
     def test_atomic_json_ignores_predictable_hardlink_temporary(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
@@ -277,6 +297,34 @@ class StageMachineTests(unittest.TestCase):
 
             self.assertEqual(marker_before, marker_path.read_bytes())
             self.assertEqual(progress_before, (project / "progress.json").read_bytes())
+
+    def test_first_start_recovery_rejects_boolean_and_float_identity_versions(self):
+        for invalid_version in (True, 1.0):
+            with self.subTest(version=invalid_version), tempfile.TemporaryDirectory() as directory:
+                project = Path(directory)
+                progress.initialize_project(project)
+                self.write_manifest(project, "chapter-1.docx")
+                marker_path = project / "work/active.json"
+                marker_path.write_text(
+                    json.dumps(
+                        {
+                            "тип": "book-translator",
+                            "версия": invalid_version,
+                            "проект": str(project.resolve()),
+                            "глава": "chapter-1.docx",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                marker_before = marker_path.read_bytes()
+                progress_before = (project / "progress.json").read_bytes()
+
+                with self.assertRaisesRegex(ValueError, "не принадлежит"):
+                    progress.start_chapter(project, "chapter-1.docx")
+
+                self.assertEqual(marker_before, marker_path.read_bytes())
+                self.assertEqual(progress_before, (project / "progress.json").read_bytes())
 
     def test_stage_cannot_be_skipped_repeated_or_unknown(self):
         with tempfile.TemporaryDirectory() as directory:

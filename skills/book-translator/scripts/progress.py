@@ -53,7 +53,8 @@ PROJECT_MARKER_NAME = "book-translator.json"
 
 def has_project_identity(value: object) -> bool:
     return isinstance(value, dict) and all(
-        value.get(key) == expected for key, expected in PROJECT_IDENTITY.items()
+        type(value.get(key)) is type(expected) and value.get(key) == expected
+        for key, expected in PROJECT_IDENTITY.items()
     )
 
 
