@@ -24,15 +24,21 @@
 
 ## Однократная установка custom agents
 
-Подставьте абсолютные пути. Сначала выполните предпросмотр без записи:
+Подставьте абсолютные пути. Сначала выполните предпросмотр без записи, затем отдельно подтвердите запись.
 
-```text
-"<путь-к-python>" "<абсолютный-путь-к-плагину>/skills/book-translator/scripts/install-agents.py" --source "<абсолютный-путь-к-плагину>/agents" --target "<абсолютный-каталог-agents-Codex>" --plan
+### Команды для Windows (PowerShell)
+
+```powershell
+& "<путь-к-python>" "<абсолютный-путь-к-плагину>\skills\book-translator\scripts\install-agents.py" --source "<абсолютный-путь-к-плагину>\agents" --target "<абсолютный-каталог-agents-Codex>" --plan
+& "<путь-к-python>" "<абсолютный-путь-к-плагину>\skills\book-translator\scripts\install-agents.py" --source "<абсолютный-путь-к-плагину>\agents" --target "<абсолютный-каталог-agents-Codex>" --confirm
 ```
 
-После проверки плана отдельно подтвердите запись:
+Оператор `&` обязателен: без него PowerShell не запускает путь к исполняемому файлу в кавычках.
 
-```text
+### Команды для POSIX-систем
+
+```sh
+"<путь-к-python>" "<абсолютный-путь-к-плагину>/skills/book-translator/scripts/install-agents.py" --source "<абсолютный-путь-к-плагину>/agents" --target "<абсолютный-каталог-agents-Codex>" --plan
 "<путь-к-python>" "<абсолютный-путь-к-плагину>/skills/book-translator/scripts/install-agents.py" --source "<абсолютный-путь-к-плагину>/agents" --target "<абсолютный-каталог-agents-Codex>" --confirm
 ```
 
@@ -78,9 +84,19 @@ DOCX поддерживается на Windows и macOS. Pages поддержи�
 
 ## Проверки для разработчиков
 
-Используйте Python, которым будет запускаться плагин:
+Используйте Python, которым будет запускаться плагин.
 
-```text
+### Проверки в Windows PowerShell
+
+```powershell
+& "<путь-к-python>" -m unittest discover -s tests -p "test_*.py" -v
+& "<путь-к-python>" -m json.tool .codex-plugin/plugin.json
+& "<путь-к-python>" -m json.tool hooks/hooks.json
+```
+
+### Проверки в POSIX
+
+```sh
 "<путь-к-python>" -m unittest discover -s tests -p "test_*.py" -v
 "<путь-к-python>" -m json.tool .codex-plugin/plugin.json
 "<путь-к-python>" -m json.tool hooks/hooks.json

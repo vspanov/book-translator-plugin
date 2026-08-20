@@ -37,7 +37,7 @@ def advance_successful_pipeline(
     remaining: int,
     interrupt: bool = False,
     second_edit: bool = False,
-) -> None:
+) -> list[dict]:
     """Собирает все детерминированные артефакты без вызова модели."""
     chapter_work = project / "work" / chapter.stem
     chapter_work.mkdir(parents=True, exist_ok=True)
@@ -56,17 +56,27 @@ def advance_successful_pipeline(
     progress.advance_stage(project, "редактура_1", str(edited_path))
     write_json(chapter_work / "completeness-2.json", {"ошибки": []})
     progress.advance_stage(project, "полнота_2", str(chapter_work / "completeness-2.json"))
-    write_json(chapter_work / "report-2.json", {"статус": "пройдено", "замечания": []})
+    report_2 = {
+        "статус": "нужна_редактура" if second_edit else "пройдено",
+        "замечания": [{"блок": "B000001", "рекомендация": "Уточнить формулировку."}] if second_edit else [],
+    }
+    write_json(chapter_work / "report-2.json", report_2)
     progress.advance_stage(project, "проверка_2", str(chapter_work / "report-2.json"))
-    if second_edit:
+    final_translation = translated
+    if report_2["статус"] == "нужна_редактура":
         progress.request_second_edit(project)
         edited_second_path = chapter_work / "edited-2.json"
-        write_json(edited_second_path, translated)
+        final_translation = copy.deepcopy(translated)
+        final_translation[0]["фрагменты"][0]["текст"] += " после редакции"
+        if not documents.validate_translation(source, final_translation):
+            write_json(edited_second_path, final_translation)
+        else:
+            raise AssertionError("Вторая редактура нарушила структуру блоков.")
         progress.advance_stage(project, "редактура_2", str(edited_second_path))
         write_json(chapter_work / "report-3.json", {"статус": "пройдено", "замечания": []})
         progress.advance_stage(project, "проверка_3", str(chapter_work / "report-3.json"))
     built = chapter_work / chapter.name
-    documents.rebuild_docx(chapter, translated, built)
+    documents.rebuild_docx(chapter, final_translation, built)
     progress.advance_stage(project, "сборка", str(built))
     next_state = chapter_work / "next-state"
     shutil.copytree(project / "state", next_state)
@@ -86,6 +96,7 @@ def advance_successful_pipeline(
     )
     transaction = progress.prepare_transaction(project, chapter.name, built, next_state, next_progress)
     progress.commit_transaction(project, transaction, interrupt_after="state" if interrupt else None)
+    return final_translation
 
 
 class PipelineIntegrationTests(unittest.TestCase):
@@ -116,7 +127,7 @@ class PipelineIntegrationTests(unittest.TestCase):
                 translated = copy.deepcopy(source)
                 translated[0]["фрагменты"][0]["текст"] = f"Глава {index + 1}"
                 self.assertEqual([], documents.validate_translation(source, translated))
-                advance_successful_pipeline(
+                final_translation = advance_successful_pipeline(
                     project,
                     chapter,
                     source,
@@ -133,7 +144,10 @@ class PipelineIntegrationTests(unittest.TestCase):
                 self.assertEqual([], progress.check_completed_chapter(project, chapter.name))
                 published = documents.extract_docx(project / "output" / chapter.name, project / "work" / chapter.stem / "published.json")
                 self.assertEqual([block["идентификатор"] for block in source], [block["идентификатор"] for block in published])
-                self.assertEqual(f"Глава {index + 1}", published[0]["фрагменты"][0]["текст"])
+                self.assertEqual(
+                    final_translation[0]["фрагменты"][0]["текст"],
+                    published[0]["фрагменты"][0]["текст"],
+                )
 
             self.assertEqual([], documents.verify_manifest(project, manifest))
             self.assertEqual(input_hashes, {path.name: sha256(path) for path in input_dir.glob("*.docx")})
@@ -158,8 +172,8 @@ class PipelineIntegrationTests(unittest.TestCase):
             self.assertEqual(0, hook.returncode, hook.stderr)
             self.assertEqual({"continue": True, "suppressOutput": True}, json.loads(hook.stdout))
 
-    def test_invalid_translation_keeps_published_output_and_memory_unchanged(self):
-        """Ловит публикацию результата или памяти до успешной проверки полноты."""
+    def test_failed_completeness_records_error_without_publishing_or_rewriting_memory(self):
+        """Ловит публикацию результата или памяти до неуспешной проверки полноты."""
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
             input_dir = project / "input"
@@ -179,12 +193,42 @@ class PipelineIntegrationTests(unittest.TestCase):
             advance_successful_pipeline(project, first, source, translated, remaining=1)
             output_hash = progress.directory_sha256(project / "output")
             state_hash = progress.directory_sha256(project / "state")
+            accepted_progress = progress.load_progress(project)
 
             progress.start_chapter(project, second.name)
             source = documents.extract_docx(second, project / "work" / second.stem / "source.json")
-            self.assertIn("отсутствует", " ".join(documents.validate_translation(source, [])))
+            draft_path = project / "work" / second.stem / "draft.json"
+            write_json(draft_path, [])
+            progress.advance_stage(project, "извлечение", str(project / "work" / second.stem / "source.json"))
+            progress.advance_stage(project, "перевод", str(draft_path))
+            errors = documents.validate_translation(source, [])
+            self.assertIn("отсутствует", " ".join(errors))
+            completeness_path = project / "work" / second.stem / "completeness-1.json"
+            write_json(completeness_path, {"ошибки": errors})
+            progress.record_failure(project, "полнота_1", "Проверка полноты выявила пропущенный блок.")
+            failed_progress = progress.load_progress(project)
+            self.assertEqual("ошибка", failed_progress["статус_книги"])
+            self.assertEqual("полнота_1", failed_progress["этап"])
+            self.assertEqual("Проверка полноты выявила пропущенный блок.", failed_progress["ошибка"])
+            self.assertEqual(first.name, failed_progress["последняя_готовая_глава"])
+            self.assertEqual(accepted_progress["sha256_результата"], failed_progress["sha256_результата"])
+            self.assertEqual(accepted_progress["sha256_памяти"], failed_progress["sha256_памяти"])
+            active = json.loads((project / "work" / "active.json").read_text(encoding="utf-8"))
+            self.assertEqual("полнота_1", active["этап_ошибки"])
+            self.assertEqual("Проверка полноты выявила пропущенный блок.", active["объяснение"])
             self.assertEqual(output_hash, progress.directory_sha256(project / "output"))
             self.assertEqual(state_hash, progress.directory_sha256(project / "state"))
+            self.assertNotEqual(accepted_progress, failed_progress)
+            hook = subprocess.run(
+                [sys.executable, str(ROOT / "hooks" / "check-progress.py")],
+                input=json.dumps({"cwd": str(project)}),
+                text=True,
+                capture_output=True,
+                check=False,
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+            self.assertEqual(0, hook.returncode, hook.stderr)
+            self.assertEqual({"continue": True, "suppressOutput": True}, json.loads(hook.stdout))
 
 
 if __name__ == "__main__":
