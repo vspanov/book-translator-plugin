@@ -16,6 +16,12 @@ EXPECTED = {
     "editor.toml": "book_translator_editor",
     "state-updater.toml": "book_translator_state_updater",
 }
+EXPECTED_MODELS = {
+    "translator.toml": ("gpt-5.6-sol", "high"),
+    "verifier.toml": ("gpt-5.6-sol", "xhigh"),
+    "editor.toml": ("gpt-5.6-sol", "high"),
+    "state-updater.toml": ("gpt-5.6-luna", "max"),
+}
 
 
 def load_installer():
@@ -27,7 +33,7 @@ def load_installer():
 
 
 class AgentDefinitionTests(unittest.TestCase):
-    def test_four_narrow_agents_have_russian_instructions_and_no_model_pin(self):
+    def test_four_narrow_agents_pin_approved_models_and_reasoning(self):
         self.assertEqual(set(EXPECTED), {path.name for path in (ROOT / "agents").glob("*.toml")})
         for filename, name in EXPECTED.items():
             with self.subTest(filename=filename):
@@ -35,9 +41,21 @@ class AgentDefinitionTests(unittest.TestCase):
                 self.assertEqual(name, data["name"])
                 self.assertEqual("workspace-write", data["sandbox_mode"])
                 self.assertGreater(len(data["developer_instructions"]), 300)
-                self.assertNotIn("model", data)
-                self.assertNotIn("model_reasoning_effort", data)
+                self.assertEqual(EXPECTED_MODELS[filename], (data["model"], data["model_reasoning_effort"]))
                 self.assertIn("рус", (data["description"] + data["developer_instructions"]).lower())
+
+    def test_agents_cannot_search_network_or_spawn_other_agents(self):
+        for filename in EXPECTED:
+            with self.subTest(filename=filename):
+                data = tomllib.loads((ROOT / "agents" / filename).read_text(encoding="utf-8"))
+                instructions = data["developer_instructions"].lower()
+                self.assertFalse(data["tools"]["web_search"])
+                self.assertFalse(data["sandbox_workspace_write"]["network_access"])
+                self.assertFalse(data["agents"]["enabled"])
+                self.assertIn("веб-поиск", instructions)
+                self.assertIn("mcp", instructions)
+                self.assertIn("плагин", instructions)
+                self.assertIn("внешние навыки", instructions)
 
     def test_editor_allows_minimal_required_neighbor_change(self):
         instructions = tomllib.loads((ROOT / "agents" / "editor.toml").read_text(encoding="utf-8"))["developer_instructions"].lower()
