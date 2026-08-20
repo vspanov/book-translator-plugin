@@ -20,6 +20,7 @@ import documents
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R = "http://schemas.openxmlformats.org/package/2006/relationships"
+OFFICE_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 CT = "http://schemas.openxmlformats.org/package/2006/content-types"
 
 
@@ -77,6 +78,51 @@ def add_footnote(path: Path) -> None:
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
         for name, content in contents.items():
             archive.writestr(name, content)
+
+
+def add_hyperlink(path: Path, *, in_footnote: bool) -> None:
+    if in_footnote:
+        add_footnote(path)
+    part_name = "word/footnotes.xml" if in_footnote else "word/document.xml"
+    relationships_name = (
+        "word/_rels/footnotes.xml.rels"
+        if in_footnote
+        else "word/_rels/document.xml.rels"
+    )
+    with zipfile.ZipFile(path) as archive:
+        root = ElementTree.fromstring(archive.read(part_name))
+        relationships = (
+            ElementTree.fromstring(archive.read(relationships_name))
+            if relationships_name in archive.namelist()
+            else ElementTree.Element(f"{{{R}}}Relationships")
+        )
+    paragraph = root.findall(f".//{{{W}}}p")[-1]
+    hyperlink = ElementTree.SubElement(
+        paragraph,
+        f"{{{W}}}hyperlink",
+        {f"{{{OFFICE_R}}}id": "rIdVisibleLink"},
+    )
+    run = ElementTree.SubElement(hyperlink, f"{{{W}}}r")
+    ElementTree.SubElement(run, f"{{{W}}}t").text = "Visible hyperlink text"
+    ElementTree.SubElement(
+        relationships,
+        f"{{{R}}}Relationship",
+        {
+            "Id": "rIdVisibleLink",
+            "Type": f"{OFFICE_R}/hyperlink",
+            "Target": "https://example.invalid/",
+            "TargetMode": "External",
+        },
+    )
+    _rewrite_zip(
+        path,
+        {
+            part_name: ElementTree.tostring(root, encoding="utf-8", xml_declaration=True),
+            relationships_name: ElementTree.tostring(
+                relationships, encoding="utf-8", xml_declaration=True
+            ),
+        },
+    )
 
 
 def block(identifier: str, text: str, *, footnote: str | None = None) -> dict:
@@ -251,6 +297,22 @@ class DocxRoundTripTests(unittest.TestCase):
 
 
 class DocxInspectionTests(unittest.TestCase):
+    def test_body_and_footnote_hyperlinks_are_rejected_before_extraction(self):
+        for part in ("body", "footnotes"):
+            with self.subTest(part=part), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "hyperlink.docx"
+                target = root / "blocks.json"
+                make_docx(source)
+                add_hyperlink(source, in_footnote=part == "footnotes")
+
+                self.assertTrue(
+                    any("гиперссыл" in error.lower() for error in documents.inspect_docx(source))
+                )
+                with self.assertRaisesRegex(ValueError, "гиперссыл"):
+                    documents.extract_docx(source, target)
+                self.assertFalse(target.exists())
+
     def test_inspect_rejects_malformed_xml_before_valid_duplicate(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "duplicate-core.docx"

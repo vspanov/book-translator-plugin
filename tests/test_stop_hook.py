@@ -38,7 +38,18 @@ def run_hook(
 
 def activate(project: Path, state: dict | None = None) -> None:
     (project / "work").mkdir()
-    (project / "work" / "active.json").write_text("{}", encoding="utf-8")
+    identity = {"тип": "book-translator", "версия": 1}
+    (project / "work" / "book-translator.json").write_text(
+        json.dumps(identity, ensure_ascii=False), encoding="utf-8"
+    )
+    active = {
+        **identity,
+        "проект": str(project.resolve()),
+        "глава": None if state is None else state.get("текущая_глава"),
+    }
+    (project / "work" / "active.json").write_text(
+        json.dumps(active, ensure_ascii=False), encoding="utf-8"
+    )
     if state is not None:
         (project / "progress.json").write_text(
             json.dumps(state, ensure_ascii=False), encoding="utf-8"
@@ -67,7 +78,7 @@ def commit_chapter(project: Path, chapter_name: str) -> Path:
         "последняя_готовая_глава": chapter_name,
         "ошибка": None,
     })
-    result = project / "work" / f"{chapter_name}-result.docx"
+    result = project / "work" / chapter_name
     result.write_bytes(b"result")
     transaction = progress.prepare_transaction(
         project,
@@ -104,6 +115,25 @@ class StopHookTests(unittest.TestCase):
     def test_allows_ordinary_folder(self):
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(ALLOW, run_hook(Path(directory)))
+
+    def test_allows_unrelated_generic_active_marker_without_project_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            (project / "work").mkdir()
+            (project / "work/active.json").write_text("{}", encoding="utf-8")
+
+            self.assertEqual(ALLOW, run_hook(project))
+
+    def test_initialized_project_blocks_at_intermediate_stage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            progress.initialize_project(project)
+            progress.start_chapter(project, "chapter-1.docx")
+
+            result = run_hook(project)
+
+            self.assertEqual("block", result["decision"])
+            self.assertIn("chapter-1.docx", result["reason"])
 
     def test_blocks_intermediate_stage_and_does_not_modify_files(self):
         with tempfile.TemporaryDirectory() as directory:

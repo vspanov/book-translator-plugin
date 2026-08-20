@@ -12,10 +12,32 @@ sys.stdin.reconfigure(encoding="utf-8")
 sys.stdout.reconfigure(encoding="utf-8")
 PLUGIN_ROOT = Path(os.environ.get("PLUGIN_ROOT", Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(PLUGIN_ROOT / "skills" / "book-translator" / "scripts"))
-from progress import check_completed_chapter, check_consistency, is_unsafe_link
+from progress import (
+    PROJECT_MARKER_NAME,
+    check_completed_chapter,
+    check_consistency,
+    has_project_identity,
+    is_unsafe_link,
+)
 
 
 ALLOW = {"continue": True, "suppressOutput": True}
+
+
+def safe_identity(path: Path, parent: Path) -> bool:
+    if (
+        is_unsafe_link(parent)
+        or not parent.is_dir()
+        or is_unsafe_link(path)
+        or not path.is_file()
+        or path.resolve().parent != parent.resolve()
+    ):
+        return False
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return has_project_identity(value)
 
 
 def find_project(start: Path) -> Path | None:
@@ -24,7 +46,13 @@ def find_project(start: Path) -> Path | None:
         for candidate in (current, *current.parents):
             work = candidate / "work"
             active_path = work / "active.json"
-            if is_unsafe_link(active_path) or active_path.exists():
+            active_exists = is_unsafe_link(active_path) or active_path.exists()
+            if is_unsafe_link(work) and active_exists:
+                return candidate
+            if active_exists and (
+                safe_identity(active_path, work)
+                or safe_identity(work / PROJECT_MARKER_NAME, work)
+            ):
                 return candidate
     except (OSError, ValueError):
         return None
@@ -81,8 +109,18 @@ def evaluate(event: dict) -> dict:
         return block("Не удалось прочитать маркер активного перевода.")
     if not isinstance(marker, dict):
         return block("Маркер активного перевода должен содержать объект.")
+    if not has_project_identity(marker):
+        return block("Маркер активного перевода не подтверждает принадлежность book-translator.")
+    if marker.get("проект") != str(project.resolve()):
+        return block("Маркер активного перевода относится к другому проекту.")
 
     progress_path = project / "progress.json"
+    if (
+        is_unsafe_link(progress_path)
+        or not progress_path.is_file()
+        or progress_path.resolve().parent != project.resolve()
+    ):
+        return block("Путь progress.json активного перевода небезопасен.")
     try:
         state = json.loads(progress_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):

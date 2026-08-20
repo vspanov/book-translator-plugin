@@ -23,13 +23,36 @@ UNSUPPORTED_XML = {
     "ins": "Документ содержит отслеживаемые вставки.",
     "del": "Документ содержит отслеживаемые удаления.",
     "txbxContent": "Документ содержит связанные текстовые блоки.",
+    "hyperlink": "Документ содержит гиперссылки, которые первая версия не переводит безопасно.",
 }
+
+
+def normalize_output_format(output_format: str) -> str | None:
+    if not isinstance(output_format, str):
+        return None
+    selected = output_format.strip().casefold()
+    if selected in {
+        "как-в-оригинале",
+        "как_в_оригинале",
+        "как в оригинале",
+        "оригинал",
+        "original",
+    }:
+        return "original"
+    if selected in {"docx", ".docx"}:
+        return "docx"
+    if selected in {"pages", ".pages"}:
+        return "pages"
+    return None
 
 
 def preflight_formats(
     input_suffixes: set[str], output_format: str, system: str, pages_available: bool
 ) -> list[str]:
-    wants_pages = ".pages" in {suffix.casefold() for suffix in input_suffixes} or output_format.casefold().lstrip(".") == "pages"
+    normalized = normalize_output_format(output_format)
+    if normalized is None:
+        return [f"Неподдерживаемый выходной формат: {output_format}."]
+    wants_pages = ".pages" in {suffix.casefold() for suffix in input_suffixes} or normalized == "pages"
     if system == "Windows" and wants_pages:
         return ["Windows не поддерживает Pages: используйте Mac с Pages или сохраните документ как DOCX."]
     if system == "Darwin" and wants_pages and not pages_available:
@@ -241,12 +264,12 @@ def verify_manifest(project_dir: Path, manifest: dict) -> list[str]:
 
 
 def _output_suffix(chapter: Path, output_format: str) -> str | None:
-    selected = output_format.strip().casefold()
-    if selected in {"как в оригинале", "оригинал", "original"}:
+    selected = normalize_output_format(output_format)
+    if selected == "original":
         return chapter.suffix.casefold()
-    if selected in {"docx", ".docx"}:
+    if selected == "docx":
         return ".docx"
-    if selected in {"pages", ".pages"}:
+    if selected == "pages":
         return ".pages"
     return None
 

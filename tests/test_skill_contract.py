@@ -64,9 +64,15 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("отдельное подтверждение", self.lower)
         self.assertIn('--overwrite "{точное_имя}.toml"', self.text)
 
-    def test_custom_agents_use_zero_parent_turns(self):
+    def test_spawn_requires_real_custom_agent_selector_and_clean_context(self):
+        self.assertNotIn("agent" + "_name", self.text)
+        self.assertIn("agent_type", self.text)
         self.assertIn('fork_turns="none"', self.text)
-        self.assertIn("agent_name", self.text)
+        self.assertIn("fork_context=false", self.text)
+        self.assertIn("если доступная схема spawn не содержит `agent_type`", self.lower)
+        self.assertIn("критически остановись", self.lower)
+        self.assertIn("не передавай роль через `task_name`", self.lower)
+        self.assertIn("не запускай generic agent", self.lower)
         self.assertIn("только заполненный шаблон", self.lower)
         self.assertIn("запуск с наследованием истории по умолчанию запрещён", self.lower)
 
@@ -81,7 +87,7 @@ class SkillContractTests(unittest.TestCase):
             "роль",
             "абсолютные пути необходимых входов",
             "ровно один абсолютный путь ожидаемого output",
-            "метаданные `agent_name` и `fork_turns` находятся вне стартового сообщения",
+            "метаданные spawn находятся вне стартового сообщения",
         ):
             self.assertIn(phrase.casefold(), shape.casefold())
 
@@ -149,7 +155,11 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("окончательно принят", self.lower)
         self.assertIn("не после части", self.lower)
         self.assertIn("не изменяя действующий state", self.lower)
+        self.assertIn("{chapter_work}/next-state/", self.text)
+        self.assertIn("проверь все файлы в `next-state/`", self.lower)
+        self.assertIn("next_state=next_state", self.text)
         self.assertIn("commit_transaction", self.text)
+        self.assertIn("result_name=built_document.name", self.text)
         self.assertIn("только после успешной фиксации", self.lower)
 
     def test_start_tasks_use_absolute_inputs_and_exactly_one_output(self):
@@ -160,6 +170,7 @@ class SkillContractTests(unittest.TestCase):
         expected = {
             "translator": {
                 "agent": "book_translator_translator",
+                "task": "book-translation-{chapter_id}-translator",
                 "inputs": ("translation-principles.md", "source-blocks.json", "chunks-manifest.json", "{project}/state/"),
                 "input_lines": 3,
                 "output": "{chapter_work}/draft.json",
@@ -167,6 +178,7 @@ class SkillContractTests(unittest.TestCase):
             },
             "verifier 1": {
                 "agent": "book_translator_verifier",
+                "task": "book-translation-{chapter_id}-verifier-1",
                 "inputs": ("verification-rules.md", "source-blocks.json", "draft.json", "{project}/state/"),
                 "input_lines": 4,
                 "output": "{chapter_work}/report-1.json",
@@ -174,6 +186,7 @@ class SkillContractTests(unittest.TestCase):
             },
             "editor 1": {
                 "agent": "book_translator_editor",
+                "task": "book-translation-{chapter_id}-editor-1",
                 "inputs": ("translation-principles.md", "source-blocks.json", "draft.json", "report-1.json", "{project}/state/"),
                 "input_lines": 5,
                 "output": "{chapter_work}/edited-1.json",
@@ -181,6 +194,7 @@ class SkillContractTests(unittest.TestCase):
             },
             "verifier 2": {
                 "agent": "book_translator_verifier",
+                "task": "book-translation-{chapter_id}-verifier-2",
                 "inputs": ("verification-rules.md", "source-blocks.json", "edited-1.json", "{project}/state/"),
                 "input_lines": 4,
                 "output": "{chapter_work}/report-2.json",
@@ -188,6 +202,7 @@ class SkillContractTests(unittest.TestCase):
             },
             "editor 2": {
                 "agent": "book_translator_editor",
+                "task": "book-translation-{chapter_id}-editor-2",
                 "inputs": ("translation-principles.md", "source-blocks.json", "edited-1.json", "report-2.json", "{project}/state/"),
                 "input_lines": 5,
                 "output": "{chapter_work}/edited-2.json",
@@ -195,6 +210,7 @@ class SkillContractTests(unittest.TestCase):
             },
             "verifier 3": {
                 "agent": "book_translator_verifier",
+                "task": "book-translation-{chapter_id}-verifier-3",
                 "inputs": ("verification-rules.md", "source-blocks.json", "edited-2.json", "{project}/state/"),
                 "input_lines": 4,
                 "output": "{chapter_work}/report-3.json",
@@ -202,9 +218,10 @@ class SkillContractTests(unittest.TestCase):
             },
             "state-updater": {
                 "agent": "book_translator_state_updater",
+                "task": "book-translation-{chapter_id}-state-updater",
                 "inputs": ("source-blocks.json", "{final_translation}", "{project}/state/"),
                 "input_lines": 3,
-                "output": "{transaction}/new-state/",
+                "output": "{chapter_work}/next-state/",
                 "forbidden": ("report-", "draft.json", "edited-", "accepted.json"),
             },
         }
@@ -226,7 +243,16 @@ class SkillContractTests(unittest.TestCase):
                 inputs = "\n".join(input_lines)
 
                 self.assertIn(f"Custom agent: {contract['agent']}", prelude)
-                self.assertIn('Параметр изоляции запуска: fork_turns="none".', prelude)
+                self.assertIn(
+                    f'V2: task_name="{contract["task"]}", agent_type="{contract["agent"]}", '
+                    'fork_turns="none", message="заполненный шаблон ниже".',
+                    prelude,
+                )
+                self.assertIn(
+                    f'V1: agent_type="{contract["agent"]}", fork_context=false, '
+                    'message="заполненный шаблон ниже".',
+                    prelude,
+                )
                 self.assertIn("Стартовое сообщение — только заполненный шаблон ниже", prelude)
                 for phrase in ("роль", "абсолютные пути входов", "ровно один абсолютный путь output", "финальная инструкция"):
                     self.assertIn(phrase, prelude.casefold())

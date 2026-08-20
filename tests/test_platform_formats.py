@@ -1,4 +1,5 @@
 import json
+import configparser
 import os
 import sys
 import tempfile
@@ -13,6 +14,35 @@ import documents
 
 
 class PlatformFormatTests(unittest.TestCase):
+    def test_output_format_aliases_normalize_from_config_and_skill_default(self):
+        parser = configparser.ConfigParser()
+        parser.read(
+            SCRIPTS.parent / "assets/config.ini",
+            encoding="utf-8",
+        )
+        configured = parser["перевод"]["выходной_формат"]
+        aliases = {
+            configured: "original",
+            "как-в-оригинале": "original",
+            "как в оригинале": "original",
+            "оригинал": "original",
+            "original": "original",
+            "docx": "docx",
+            ".docx": "docx",
+            "pages": "pages",
+            ".pages": "pages",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            chapter = project / "chapter-1.docx"
+            chapter.write_bytes(b"source")
+            for value, expected in aliases.items():
+                with self.subTest(value=value):
+                    self.assertEqual(expected, documents.normalize_output_format(value))
+                    self.assertEqual(
+                        [], documents.check_output_conflicts(project, [chapter], value)
+                    )
+
     def test_windows_rejects_pages_input_and_output(self):
         input_errors = documents.preflight_formats({".pages"}, "docx", "Windows", False)
         output_errors = documents.preflight_formats({".docx"}, "pages", "Windows", False)

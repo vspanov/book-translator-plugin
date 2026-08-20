@@ -52,9 +52,10 @@ description: Используется, когда нужно перевести 
 - Никогда не запускай главы, части главы или ролевых агентов параллельно и не готовь следующую главу заранее.
 - Иди строго по `work/manifest.json`; следующую главу начинай только после успешной фиксации предыдущей.
 - Не выполняй художественный перевод или редактуру в основном контексте.
-- Для каждого ролевого этапа запускай новый экземпляр named custom agent с чистым контекстом. Не передавай историю родительской беседы, рассуждения или текстовые ответы прежних агентов.
-- Каждый вызов использует изолированный spawn: `agent_name="{точное_имя_custom_agent}"`, `fork_turns="none"`, `message="{только заполненный шаблон соответствующей роли ниже}"`. Запуск с наследованием истории по умолчанию запрещён.
-- Стартовое задание состоит только из четырёх частей: роль; абсолютные пути необходимых входов; ровно один абсолютный путь ожидаемого output; финальная инструкция `Не используй сведения вне перечисленных файлов.` Метаданные `agent_name` и `fork_turns` находятся вне стартового сообщения.
+- Для каждого ролевого этапа запускай новый экземпляр указанного custom agent с чистым контекстом. Не передавай историю родительской беседы, рассуждения или текстовые ответы прежних агентов.
+- Перед каждым вызовом проверь доступную схему spawn. В V2 используй указанные ниже уникальный `task_name`, `agent_type`, `fork_turns="none"` и `message`. В стабильной V1 используй `agent_type`, `fork_context=false` и `message`. Запуск с наследованием истории по умолчанию запрещён.
+- Если доступная схема spawn не содержит `agent_type`, критически остановись с русским объяснением несовместимости. Не передавай роль через `task_name` и не запускай generic agent.
+- Стартовое задание состоит только из четырёх частей: роль; абсолютные пути необходимых входов; ровно один абсолютный путь ожидаемого output; финальная инструкция `Не используй сведения вне перечисленных файлов.` Метаданные spawn находятся вне стартового сообщения.
 - Дождись агента, проверь существование и пригодность ожидаемого артефакта и лишь затем вызывай `advance_stage`.
 - Любая механическая ошибка немедленно блокирует главу. Исходники, последняя принятая память и опубликованные главы остаются неизменными.
 
@@ -69,8 +70,8 @@ description: Используется, когда нужно перевести 
 7. Запусти второй новый `book_translator_verifier` без `report-1.json`; сохрани `report-2.json` и зафиксируй `проверка_2`.
 8. Если статус `report-2.json` не `пройдено`, вызови `request_second_edit`, затем запусти ровно один дополнительный новый `book_translator_editor`. Он записывает `edited-2.json`; проверь файл через `validate_translation` и вызови `advance_stage(project, "редактура_2", artifact=edited_2)`. После этого запусти свежий `book_translator_verifier`: он записывает `report-3.json`; проверь отчёт и вызови `advance_stage(project, "проверка_3", artifact=report_3)`. При оставшейся критической ошибке или требовании редактуры вызови `record_failure(project, "проверка_3", explanation=...)`, сохрани отчёт, остановись и не публикуй главу. При критической ошибке дополнительный цикл обязателен; третья редактура запрещена.
 9. После статуса `пройдено` обозначь единственную актуальную версию как `accepted.json`, собери временный результат через `rebuild_docx` и проверь его через `inspect_docx`. Для результата Pages после явного разрешения импортируй проверенный DOCX и проверь созданный файл; промежуточный DOCX не публикуй. Только после проверки зафиксируй этап `сборка`.
-10. Только один раз после окончательно принятой и собранной главы запусти новый `book_translator_state_updater`. Не после части, черновика или неуспешной проверки. Он готовит полную память в `transaction/new-state/`, не изменяя действующий state. Проверь все файлы следующей памяти и зафиксируй этап `память`.
-11. Вызови `prepare_transaction`, проверь маркер готовности и `commit_transaction`. Только после успешной фиксации и проверки согласованности переходи к следующей главе.
+10. Только один раз после окончательно принятой и собранной главы запусти новый `book_translator_state_updater`. Не после части, черновика или неуспешной проверки. Он готовит полную память в `{chapter_work}/next-state/`, не изменяя действующий state. Проверь все файлы в `next-state/` и зафиксируй этап `память`.
+11. Вызови `prepare_transaction(project, chapter_name=chapter_name, built_document=built_document, next_state=next_state, next_progress=next_progress, result_name=built_document.name)`: функция сама создаёт хешированный каталог транзакции и копирует следующую память в его `new-state/`; идентичность исходной главы остаётся в `chapter_name`, а имя публикации берётся из проверенного итогового файла. Проверь маркер готовности и `commit_transaction`. Только после успешной фиксации и проверки согласованности переходи к следующей главе.
 
 ## Длинная глава
 
@@ -85,7 +86,8 @@ description: Используется, когда нужно перевести 
 ### Шаблон: translator
 
 Custom agent: book_translator_translator
-Параметр изоляции запуска: fork_turns="none".
+`V2: task_name="book-translation-{chapter_id}-translator", agent_type="book_translator_translator", fork_turns="none", message="заполненный шаблон ниже".`
+`V1: agent_type="book_translator_translator", fork_context=false, message="заполненный шаблон ниже".`
 Стартовое сообщение — только заполненный шаблон ниже: роль, абсолютные пути входов, ровно один абсолютный путь output и финальная инструкция; без родительской стенограммы, рассуждений и свободного текста.
 
 ```text
@@ -100,7 +102,8 @@ Custom agent: book_translator_translator
 ### Шаблон: verifier 1
 
 Custom agent: book_translator_verifier
-Параметр изоляции запуска: fork_turns="none".
+`V2: task_name="book-translation-{chapter_id}-verifier-1", agent_type="book_translator_verifier", fork_turns="none", message="заполненный шаблон ниже".`
+`V1: agent_type="book_translator_verifier", fork_context=false, message="заполненный шаблон ниже".`
 Стартовое сообщение — только заполненный шаблон ниже: роль, абсолютные пути входов, ровно один абсолютный путь output и финальная инструкция; без родительской стенограммы, рассуждений и свободного текста.
 
 ```text
@@ -116,7 +119,8 @@ Custom agent: book_translator_verifier
 ### Шаблон: editor 1
 
 Custom agent: book_translator_editor
-Параметр изоляции запуска: fork_turns="none".
+`V2: task_name="book-translation-{chapter_id}-editor-1", agent_type="book_translator_editor", fork_turns="none", message="заполненный шаблон ниже".`
+`V1: agent_type="book_translator_editor", fork_context=false, message="заполненный шаблон ниже".`
 Стартовое сообщение — только заполненный шаблон ниже: роль, абсолютные пути входов, ровно один абсолютный путь output и финальная инструкция; без родительской стенограммы, рассуждений и свободного текста.
 
 ```text
@@ -133,7 +137,8 @@ Custom agent: book_translator_editor
 ### Шаблон: verifier 2
 
 Custom agent: book_translator_verifier
-Параметр изоляции запуска: fork_turns="none".
+`V2: task_name="book-translation-{chapter_id}-verifier-2", agent_type="book_translator_verifier", fork_turns="none", message="заполненный шаблон ниже".`
+`V1: agent_type="book_translator_verifier", fork_context=false, message="заполненный шаблон ниже".`
 Стартовое сообщение — только заполненный шаблон ниже: роль, абсолютные пути входов, ровно один абсолютный путь output и финальная инструкция; без родительской стенограммы, рассуждений и свободного текста.
 
 ```text
@@ -149,7 +154,8 @@ Custom agent: book_translator_verifier
 ### Шаблон: editor 2
 
 Custom agent: book_translator_editor
-Параметр изоляции запуска: fork_turns="none".
+`V2: task_name="book-translation-{chapter_id}-editor-2", agent_type="book_translator_editor", fork_turns="none", message="заполненный шаблон ниже".`
+`V1: agent_type="book_translator_editor", fork_context=false, message="заполненный шаблон ниже".`
 Стартовое сообщение — только заполненный шаблон ниже: роль, абсолютные пути входов, ровно один абсолютный путь output и финальная инструкция; без родительской стенограммы, рассуждений и свободного текста.
 
 ```text
@@ -166,7 +172,8 @@ Custom agent: book_translator_editor
 ### Шаблон: verifier 3
 
 Custom agent: book_translator_verifier
-Параметр изоляции запуска: fork_turns="none".
+`V2: task_name="book-translation-{chapter_id}-verifier-3", agent_type="book_translator_verifier", fork_turns="none", message="заполненный шаблон ниже".`
+`V1: agent_type="book_translator_verifier", fork_context=false, message="заполненный шаблон ниже".`
 Стартовое сообщение — только заполненный шаблон ниже: роль, абсолютные пути входов, ровно один абсолютный путь output и финальная инструкция; без родительской стенограммы, рассуждений и свободного текста.
 
 ```text
@@ -182,7 +189,8 @@ Custom agent: book_translator_verifier
 ### Шаблон: state-updater
 
 Custom agent: book_translator_state_updater
-Параметр изоляции запуска: fork_turns="none".
+`V2: task_name="book-translation-{chapter_id}-state-updater", agent_type="book_translator_state_updater", fork_turns="none", message="заполненный шаблон ниже".`
+`V1: agent_type="book_translator_state_updater", fork_context=false, message="заполненный шаблон ниже".`
 Стартовое сообщение — только заполненный шаблон ниже: роль, абсолютные пути входов, ровно один абсолютный путь output и финальная инструкция; без родительской стенограммы, рассуждений и свободного текста.
 
 ```text
@@ -190,7 +198,7 @@ Custom agent: book_translator_state_updater
 Абсолютный путь к оригиналу: {chapter_work}/source-blocks.json
 Абсолютный путь к окончательно принятой версии: {final_translation}
 Абсолютный путь к действующей памяти: {project}/state/
-Единственный output: {transaction}/new-state/
+Единственный output: {chapter_work}/next-state/
 Не используй сведения вне перечисленных файлов.
 ```
 
