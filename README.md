@@ -4,7 +4,7 @@
 
 Плагин рассчитан на романы, разделённые на отдельные файлы глав. Пользователь запускает workflow из чата, выбирает папку книги, выходной формат и режим продолжения.
 
-> Текущая версия: `0.1.0`. Плагин пока устанавливается локально и не опубликован в общем каталоге плагинов.
+> Текущая версия: `0.1.0`. Плагин доступен через репозиторный marketplace, но пока не опубликован в общем каталоге плагинов.
 
 ## Главное
 
@@ -54,6 +54,7 @@
 
 | Путь | Назначение |
 |---|---|
+| `.agents/plugins/marketplace.json` | Репозиторный marketplace для установки через Codex |
 | `.codex-plugin/plugin.json` | Манифест плагина |
 | `skills/book-translator/SKILL.md` | Главный координатор workflow и команда `$book-translator` |
 | `agents/translator.toml` | Художественный переводчик |
@@ -115,79 +116,58 @@ Custom agents входят в поставку плагина и хранятс�
 
 ## Установка плагина
 
-Актуальная схема OpenAI для локальной разработки использует персональный или репозиторный marketplace. Подробный порядок создания каталога, добавления локальной записи и установки описан в [официальном руководстве OpenAI по упаковке плагинов](https://developers.openai.com/plugins/build/plugins).
+Репозиторий уже содержит marketplace в `.agents/plugins/marketplace.json`. Поэтому пользователю не нужно клонировать плагин в служебную папку или вручную изменять личный `marketplace.json`. Актуальная схема описана в [официальном руководстве OpenAI по упаковке плагинов](https://developers.openai.com/plugins/build/plugins).
 
-Ниже приведена персональная установка, доступная во всех ваших проектах.
+### Обычная установка
 
-### 1. Разместите каталог плагина
+На Windows и macOS выполните:
 
-Скопируйте или клонируйте репозиторий в:
-
-- Windows: `%USERPROFILE%\.codex\plugins\book-translator-plugin`
-- Для компьютеров Mac: `~/.codex/plugins/book-translator-plugin`
-
-Можно использовать другое место внутри корня персонального marketplace, но тогда измените `source.path` в следующем шаге.
-
-Пример клонирования в рекомендуемый каталог Windows:
-
-```powershell
-git clone "https://github.com/vspanov/book-translator-plugin.git" "$env:USERPROFILE\.codex\plugins\book-translator-plugin"
+```text
+codex plugin marketplace add vspanov/book-translator-plugin --ref main
 ```
 
-Пример клонирования на компьютере Mac:
+Убедитесь, что источник добавлен:
 
-```sh
-git clone "https://github.com/vspanov/book-translator-plugin.git" "$HOME/.codex/plugins/book-translator-plugin"
+```text
+codex plugin marketplace list
 ```
 
-### 2. Добавьте персональный marketplace
-
-Создайте или обновите файл:
-
-- Windows: `%USERPROFILE%\.agents\plugins\marketplace.json`
-- Для компьютеров Mac: `~/.agents/plugins/marketplace.json`
-
-Минимальный пример:
-
-```json
-{
-  "name": "local-books",
-  "interface": {
-    "displayName": "Локальные плагины для книг"
-  },
-  "plugins": [
-    {
-      "name": "book-translator-plugin",
-      "source": {
-        "source": "local",
-        "path": "./.codex/plugins/book-translator-plugin"
-      },
-      "policy": {
-        "installation": "AVAILABLE",
-        "authentication": "ON_INSTALL"
-      },
-      "category": "Productivity"
-    }
-  ]
-}
-```
-
-Если `marketplace.json` уже существует, добавьте объект плагина в имеющийся массив `plugins` — не заменяйте остальные записи.
-
-### 3. Установите плагин в приложении
+Затем:
 
 1. Перезапустите приложение `ChatGPT desktop app`.
 2. Откройте каталог плагинов.
-3. Выберите источник «Локальные плагины для книг».
+3. Выберите источник «Плагины BooksRu».
 4. Найдите `book-translator-plugin` и установите его.
 5. Проверьте, что skill `book-translator` доступен в новом чате.
 6. Просмотрите `hooks/hooks.json` и явно доверьте hook только после проверки его команды.
 
 Установка или включение плагина не означает автоматического доверия его hook: Codex отдельно просит просмотреть и разрешить неменеджерский hook.
 
-### Обновление локальной версии
+### Обновление
 
-Обновите файлы в каталоге, на который указывает marketplace, затем перезапустите ChatGPT desktop app. Локальная установленная копия загружается из кеша плагинов, поэтому при необходимости обновите или переустановите запись через каталог плагинов.
+Обновите локальную копию marketplace:
+
+```text
+codex plugin marketplace upgrade booksru-plugins
+```
+
+Затем перезапустите приложение и обновите либо переустановите плагин в каталоге плагинов. Если имя marketplace в выводе `codex plugin marketplace list` отличается, передайте команде `upgrade` именно показанное имя. Без аргумента команда `codex plugin marketplace upgrade` обновляет все добавленные источники.
+
+### Локальная установка для разработки
+
+Если нужно проверять незапушенные изменения, клонируйте репозиторий в произвольную папку:
+
+```text
+git clone https://github.com/vspanov/book-translator-plugin.git
+```
+
+Добавьте абсолютный путь к корню клона как локальный marketplace:
+
+```text
+codex plugin marketplace add "<абсолютный-путь-к-book-translator-plugin>"
+```
+
+После изменений перезапустите ChatGPT desktop app и обновите либо переустановите плагин. Приложение загружает установленную копию из кеша, а не напрямую из рабочей папки.
 
 ## Установка Python-зависимости
 
@@ -410,10 +390,10 @@ $book-translator Переведи главы из текущей папки в D
 ### Skill не появился после установки
 
 - перезапустите приложение `ChatGPT desktop app`;
-- проверьте запись в `marketplace.json`;
-- убедитесь, что `source.path` начинается с `./` и указывает внутрь корня marketplace;
+- выполните `codex plugin marketplace list` и убедитесь, что источник доступен;
+- выполните `codex plugin marketplace upgrade booksru-plugins`;
 - откройте каталог плагинов и проверьте, что плагин установлен и включён;
-- после изменения локальных файлов обновите или переустановите локальную запись.
+- после изменения локальных файлов перезапустите приложение и обновите либо переустановите плагин.
 
 ### Не найдены custom agents
 
@@ -464,6 +444,7 @@ $book-translator Переведи главы из текущей папки в D
 
 ```powershell
 & "<путь-к-python>" -m unittest discover -s tests -p "test_*.py" -v
+& "<путь-к-python>" -m json.tool .agents/plugins/marketplace.json
 & "<путь-к-python>" -m json.tool .codex-plugin/plugin.json
 & "<путь-к-python>" -m json.tool hooks/hooks.json
 ```
@@ -472,6 +453,7 @@ $book-translator Переведи главы из текущей папки в D
 
 ```sh
 "<путь-к-python>" -m unittest discover -s tests -p "test_*.py" -v
+"<путь-к-python>" -m json.tool .agents/plugins/marketplace.json
 "<путь-к-python>" -m json.tool .codex-plugin/plugin.json
 "<путь-к-python>" -m json.tool hooks/hooks.json
 ```

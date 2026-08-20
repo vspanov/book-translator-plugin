@@ -1,0 +1,21 @@
+{
+  "name": "booksru-plugins",
+  "interface": {
+    "displayName": "Плагины BooksRu"
+  },
+  "plugins": [
+    {
+      "name": "book-translator-plugin",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/vspanov/book-translator-plugin.git",
+        "ref": "main"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
