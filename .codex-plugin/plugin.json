@@ -1,6 +1,6 @@
 {
   "name": "book-translator-plugin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Последовательный художественный перевод английских книг на русский язык с проверкой полноты и сохранением оформления",
   "skills": "./skills/",
   "hooks": "./hooks/hooks.json"

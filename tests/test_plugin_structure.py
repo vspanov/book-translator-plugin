@@ -10,7 +10,7 @@ class PluginStructureTests(unittest.TestCase):
     def test_manifest_declares_skill_and_hook(self):
         manifest = json.loads((ROOT / ".codex-plugin/plugin.json").read_text(encoding="utf-8"))
         self.assertEqual("book-translator-plugin", manifest["name"])
-        self.assertEqual("0.1.0", manifest["version"])
+        self.assertEqual("0.1.1", manifest["version"])
         self.assertEqual("./skills/", manifest["skills"])
         self.assertEqual("./hooks/hooks.json", manifest["hooks"])
         self.assertIn("перевод", manifest["description"].lower())

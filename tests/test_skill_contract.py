@@ -43,6 +43,8 @@ class SkillContractTests(unittest.TestCase):
             "манифест",
             "конфликты выходных имён",
             "четырёх custom agents",
+            "точное соответствие",
+            "точечное обновление",
             "не устанавливай",
             "явного разрешения",
             "предпросмотр",
@@ -112,6 +114,11 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("не передавай историю", self.lower)
         self.assertIn("не выполняй художественный перевод", self.lower)
         self.assertIn("не подменяй", self.lower)
+
+    def test_coordinator_recommends_approved_model_without_claiming_to_switch_it(self):
+        self.assertIn("gpt-5.6-terra", self.lower)
+        self.assertIn('model_reasoning_effort = "medium"', self.lower)
+        self.assertIn("навык не может переключить модель текущего чата", self.lower)
 
     def test_long_chapter_uses_one_translator_for_all_chunks(self):
         self.assertIn("60000", self.text)
