@@ -1,397 +1,40 @@
 from __future__ import annotations
 
+import configparser
 import hashlib
 import json
 import os
+import re
 import shutil
-import stat
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 
-ASSET_NAMES = {
-    "project-readme.md": "README.md",
-    "config.ini": "config.ini",
-}
-STATE_ASSETS = (
-    "characters.md",
-    "glossary.md",
-    "style-guide.md",
-    "story-state.md",
-    "chapter-summaries.md",
-    "decisions.md",
+SCHEMA_VERSION = 2
+PROJECT_MARKER_NAME = ".book-translator-project.json"
+STATE_FILES = (
+    "glossary.md", "decisions.md", "characters.md", "style-guide.md",
+    "story-state.md", "chapter-summaries.md",
 )
-STAGE_AFTER = {
-    "ожидает_извлечения": "извлечение",
-    "извлечение": "перевод",
-    "перевод": "полнота_1",
-    "полнота_1": "проверка_1",
-    "проверка_1": "редактура_1",
-    "редактура_1": "полнота_2",
-    "полнота_2": "проверка_2",
-    "проверка_2": "сборка",
-    "редактура_2": "проверка_3",
-    "проверка_3": "сборка",
-    "сборка": "память",
-    "память": "фиксация",
-    "фиксация": "готово",
-}
-PROGRESS_KEYS = (
-    "версия",
-    "статус_книги",
-    "текущая_глава",
-    "этап",
-    "последняя_готовая_глава",
-    "ошибка",
-)
-BOOK_STATUSES = {"не_начат", "в_работе", "ошибка", "готово"}
-KNOWN_STAGES = {None, "ожидает_извлечения", *STAGE_AFTER, *STAGE_AFTER.values()}
-PROJECT_IDENTITY = {"тип": "book-translator", "версия": 1}
-PROJECT_MARKER_NAME = "book-translator.json"
+VALID_MODES = {"продолжить", "начать-заново", "перевести-заново"}
+VALID_REVIEW_MODES = {"после-каждого-файла", "в-финале"}
 
 
-def has_project_identity(value: object) -> bool:
-    return isinstance(value, dict) and all(
-        type(value.get(key)) is type(expected) and value.get(key) == expected
-        for key, expected in PROJECT_IDENTITY.items()
-    )
-
-
-def is_unsafe_link(path: Path) -> bool:
-    try:
-        attributes = getattr(path.lstat(), "st_file_attributes", 0)
-    except OSError:
-        attributes = 0
-    return path.is_symlink() or bool(
-        attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-    )
-
-
-_is_link = is_unsafe_link
-
-
-def _project_directory(project_dir: Path, name: str) -> Path:
-    path = project_dir / name
-    if _is_link(path) or not path.is_dir() or path.resolve().parent != project_dir:
-        raise ValueError(f"Путь {name}/ внутри проекта небезопасен.")
-    return path
-
-
-def _transactions_directory(project_dir: Path, create: bool = False) -> Path:
-    work = _project_directory(project_dir, "work")
-    transactions = work / "transactions"
-    if (
-        _is_link(transactions)
-        or (transactions.exists() and not transactions.is_dir())
-        or transactions.resolve().parent != work.resolve()
-    ):
-        raise ValueError("Путь work/transactions/ внутри проекта небезопасен.")
-    if create:
-        transactions.mkdir(exist_ok=True)
-    return transactions
-
-
-def _transaction_directory(transactions: Path, path: Path) -> Path:
-    transaction = Path(os.path.abspath(path))
-    if (
-        transaction.parent != transactions.absolute()
-        or _is_link(transaction)
-        or not transaction.is_dir()
-        or transaction.resolve().parent != transactions.resolve()
-    ):
-        raise ValueError("каталог транзакции небезопасен.")
-    return transaction
-
-
-def _confined_transaction_child(
-    transaction: Path, name: str, directory: bool = False, required: bool = True
-) -> Path:
-    path = transaction / name
-    if _is_link(path):
-        raise ValueError(f"Путь {name} внутри транзакции небезопасен.")
-    present = path.is_dir() if directory else path.is_file()
-    if (
-        (required and not present)
-        or (path.exists() and (not present or path.resolve().parent != transaction.resolve()))
-    ):
-        raise ValueError(f"Путь {name} внутри транзакции небезопасен.")
-    return path
-
-
-def initialize_project(project_dir: Path) -> None:
-    project_dir = project_dir.resolve()
-    assets = Path(__file__).resolve().parents[1] / "assets"
-    for name in ("output", "state", "work"):
-        (project_dir / name).mkdir(parents=True, exist_ok=True)
-    work_dir = _project_directory(project_dir, "work")
-    project_marker = work_dir / PROJECT_MARKER_NAME
-    if _is_link(project_marker) or (project_marker.exists() and not project_marker.is_file()):
-        raise ValueError("Маркер проекта перевода небезопасен.")
-    if project_marker.exists():
-        if not has_project_identity(_load_json(project_marker, "маркер проекта перевода")):
-            raise ValueError("Маркер проекта не принадлежит book-translator.")
-    else:
-        write_json_atomic(project_marker, PROJECT_IDENTITY)
-    for source_name, target_name in ASSET_NAMES.items():
-        target = project_dir / target_name
-        if not target.exists():
-            shutil.copy2(assets / source_name, target)
-    for name in STATE_ASSETS:
-        target = project_dir / "state" / name
-        if not target.exists():
-            shutil.copy2(assets / name, target)
-    progress_path = project_dir / "progress.json"
-    if not progress_path.exists():
-        write_json_atomic(
-            progress_path,
-            {
-                "версия": 1,
-                "статус_книги": "не_начат",
-                "текущая_глава": None,
-                "этап": None,
-                "последняя_готовая_глава": None,
-                "ошибка": None,
-            },
-        )
-
-
-def write_json_atomic(path: Path, value: dict) -> None:
-    _write_bytes_atomic(
-        path,
-        (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
-    )
-
-
-def load_progress(project_dir: Path) -> dict:
-    progress_path = project_dir.resolve() / "progress.json"
-    if _is_link(progress_path):
-        raise ValueError("Путь progress.json внутри проекта небезопасен.")
-    try:
-        value = json.loads(progress_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError("Не удалось прочитать progress.json.") from error
-    if not isinstance(value, dict):
-        raise ValueError("progress.json должен содержать объект.")
-    return value
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _write_text_atomic(path: Path, text: str) -> None:
-    _write_bytes_atomic(path, text.encode("utf-8"))
-
-
-def _write_bytes_atomic(path: Path, content: bytes) -> None:
+def _json_atomic(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = None
-    temporary = None
-    try:
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
-        )
-        temporary = Path(temporary_name)
-        with os.fdopen(descriptor, "wb") as stream:
-            descriptor = None
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
 
-def _plain_file_name(value: str, error_message: str) -> str:
-    if (
-        not isinstance(value, str)
-        or not value
-        or value in {".", ".."}
-        or Path(value).name != value
-    ):
-        raise ValueError(error_message)
-    return value
+def _copy_atomic(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    shutil.copy2(source, temporary)
+    temporary.replace(target)
 
 
-def _chapter_name(value: str) -> str:
-    return _plain_file_name(value, "Имя главы должно быть простым именем файла.")
-
-
-def _result_name(value: str) -> str:
-    return _plain_file_name(value, "Имя результата должно быть простым именем файла.")
-
-
-def _validate_manifest_start(work_dir: Path, state: dict, chapter_name: str) -> None:
-    manifest_path = work_dir / "manifest.json"
-    if _is_link(manifest_path):
-        raise ValueError("Манифест глав небезопасен.")
-    if not manifest_path.exists():
-        return
-    if not manifest_path.is_file():
-        raise ValueError("Манифест глав небезопасен.")
-    manifest = _load_json(manifest_path, "манифест глав")
-    chapters = manifest.get("главы")
-    if not isinstance(chapters, list) or not chapters:
-        raise ValueError("Манифест не содержит непустой список глав.")
-    try:
-        names = [
-            _chapter_name(chapter.get("имя"))
-            for chapter in chapters
-            if isinstance(chapter, dict)
-        ]
-    except ValueError as error:
-        raise ValueError("Манифест содержит некорректную главу.") from error
-    if len(names) != len(chapters) or len(names) != len(set(names)):
-        raise ValueError("Манифест содержит некорректные или повторяющиеся главы.")
-    if chapter_name not in names:
-        raise ValueError(f"Глава «{chapter_name}» неизвестна манифесту.")
-    last_ready = state.get("последняя_готовая_глава")
-    if last_ready is None:
-        expected = names[0]
-    else:
-        if last_ready not in names:
-            raise ValueError("Последняя готовая глава отсутствует в манифесте.")
-        last_index = names.index(last_ready)
-        if names.index(chapter_name) <= last_index:
-            raise ValueError(f"Глава «{chapter_name}» уже завершена.")
-        expected = names[last_index + 1] if last_index + 1 < len(names) else None
-    if expected is None:
-        raise ValueError("В манифесте не осталось необработанных глав.")
-    if chapter_name != expected:
-        raise ValueError(f"Следующей по манифесту должна быть глава «{expected}».")
-
-
-def start_chapter(project_dir: Path, chapter_name: str) -> None:
-    project_dir = project_dir.resolve()
-    chapter_name = _chapter_name(chapter_name)
-    work_dir = _project_directory(project_dir, "work")
-    active_path = work_dir / "active.json"
-    state = load_progress(project_dir)
-    _validate_manifest_start(work_dir, state, chapter_name)
-    active_chapter = None
-    if _is_link(active_path) or (active_path.exists() and not active_path.is_file()):
-        raise ValueError("Маркер активной главы небезопасен.")
-    if active_path.exists():
-        active = _load_json(active_path, "маркер активной главы")
-        if not has_project_identity(active):
-            raise ValueError("Маркер активной главы не принадлежит book-translator.")
-        if active.get("проект") != str(project_dir):
-            raise ValueError("Маркер активной главы относится к другому проекту.")
-        try:
-            active_chapter = _chapter_name(active.get("глава"))
-        except ValueError as error:
-            raise ValueError("Маркер активной главы содержит некорректную главу.") from error
-    if state.get("статус_книги") == "ошибка" or state.get("ошибка"):
-        raise ValueError("Нельзя начать следующую главу при зафиксированной ошибке.")
-    initial_checkpoint = (
-        state.get("статус_книги") == "не_начат"
-        and state.get("текущая_глава") is None
-        and state.get("этап") is None
-        and state.get("последняя_готовая_глава") is None
-    )
-    partial_start = active_chapter is not None and (
-        initial_checkpoint
-        or state.get("этап") == "готово" and (
-            active_chapter != state.get("текущая_глава")
-            or active_chapter != state.get("последняя_готовая_глава")
-        )
-    )
-    if partial_start and chapter_name != active_chapter:
-        raise ValueError(
-            f"Глава «{active_chapter}» уже частично начата; сначала повторите её запуск."
-        )
-    if (
-        state.get("текущая_глава") is not None and state.get("этап") != "готово"
-    ) or (active_path.exists() and state.get("этап") != "готово" and not partial_start):
-        raise ValueError("В проекте уже активна незавершённая глава.")
-    state.update(
-        {
-            "статус_книги": "в_работе",
-            "текущая_глава": chapter_name,
-            "этап": "ожидает_извлечения",
-            "ошибка": None,
-            "редакторские_циклы": 1,
-            "артефакты": {},
-        }
-    )
-    if not partial_start:
-        write_json_atomic(
-            active_path,
-            {
-                **PROJECT_IDENTITY,
-                "проект": str(project_dir),
-                "глава": chapter_name,
-                "время_начала": _utc_now(),
-            },
-        )
-    write_json_atomic(project_dir / "progress.json", state)
-
-
-def _expected_stage(state: dict) -> str | None:
-    if state.get("этап") == "проверка_2" and state.get("редакторские_циклы") == 2:
-        return "редактура_2"
-    return STAGE_AFTER.get(state.get("этап"))
-
-
-def advance_stage(project_dir: Path, completed_stage: str, artifact: str) -> None:
-    project_dir = project_dir.resolve()
-    state = load_progress(project_dir)
-    if state.get("статус_книги") == "ошибка":
-        raise ValueError("Нельзя продолжить главу с зафиксированной ошибкой.")
-    expected = _expected_stage(state)
-    if completed_stage != expected:
-        raise ValueError(
-            f"Нельзя завершить этап {completed_stage}: ожидался {expected or 'допустимый этап'}."
-        )
-    if not isinstance(artifact, str) or not artifact:
-        raise ValueError("Для завершённого этапа нужен путь к артефакту.")
-    state["этап"] = completed_stage
-    state.setdefault("артефакты", {})[completed_stage] = artifact
-    write_json_atomic(project_dir / "progress.json", state)
-
-
-def record_failure(project_dir: Path, stage: str, explanation: str) -> None:
-    project_dir = project_dir.resolve()
-    state = load_progress(project_dir)
-    if not isinstance(explanation, str) or not explanation.strip():
-        raise ValueError("Нужно объяснить причину ошибки.")
-    if stage not in {state.get("этап"), _expected_stage(state)}:
-        raise ValueError("Ошибка относится не к текущему или ожидаемому этапу.")
-    state.update({"статус_книги": "ошибка", "этап": stage, "ошибка": explanation})
-    write_json_atomic(project_dir / "progress.json", state)
-    active_path = _project_directory(project_dir, "work") / "active.json"
-    if active_path.is_file():
-        try:
-            active = json.loads(active_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            active = {
-                **PROJECT_IDENTITY,
-                "проект": str(project_dir),
-                "глава": state.get("текущая_глава"),
-            }
-        active.update({"этап_ошибки": stage, "объяснение": explanation})
-        write_json_atomic(active_path, active)
-
-
-def request_second_edit(project_dir: Path) -> None:
-    project_dir = project_dir.resolve()
-    state = load_progress(project_dir)
-    stage = state.get("этап")
-    if stage == "проверка_3":
-        raise ValueError("третий редакторский цикл запрещён.")
-    if stage != "проверка_2":
-        raise ValueError("Второй редакторский цикл разрешён только после проверки_2.")
-    if state.get("редакторские_циклы", 1) >= 2:
-        raise ValueError("второй цикл уже запрошен.")
-    state["редакторские_циклы"] = 2
-    write_json_atomic(project_dir / "progress.json", state)
-
-
-def _file_sha256(path: Path) -> str:
+def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -400,663 +43,507 @@ def _file_sha256(path: Path) -> str:
 
 
 def directory_sha256(path: Path) -> str:
-    if _is_link(path):
-        raise ValueError(f"Ссылка на каталог запрещена: {path}.")
-    path = path.resolve()
-    if not path.is_dir():
-        raise ValueError(f"Каталог не найден: {path}.")
     digest = hashlib.sha256()
-    for item in sorted(path.rglob("*"), key=lambda value: value.relative_to(path).as_posix()):
-        if _is_link(item):
-            raise ValueError(f"Ссылка внутри каталога запрещена: {item}.")
-        if item.is_file():
-            digest.update(item.relative_to(path).as_posix().encode("utf-8"))
-            digest.update(b"\0")
-            with item.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            digest.update(b"\0")
+    for item in sorted((entry for entry in path.rglob("*") if entry.is_file()), key=lambda entry: entry.relative_to(path).as_posix()):
+        digest.update(item.relative_to(path).as_posix().encode())
+        digest.update(file_sha256(item).encode())
     return digest.hexdigest()
 
 
-def _result_kind(path: Path, result_name: str) -> str:
-    if _is_link(path):
-        raise ValueError("Собранный результат не должен быть ссылкой.")
-    if path.is_file():
-        return "файл"
-    if (
-        path.is_dir()
-        and path.suffix.casefold() == ".pages"
-        and Path(result_name).suffix.casefold() == ".pages"
-    ):
-        directory_sha256(path)
-        if not any(item.is_file() for item in path.rglob("*")):
-            raise ValueError("Собранный пакет Pages пуст.")
-        return "пакет_pages"
-    raise ValueError(
-        "Собранный документ должен быть файлом либо непустым пакетом .pages внутри work/."
-    )
+def _asset_root() -> Path:
+    return Path(__file__).resolve().parents[1] / "assets"
 
 
-def _result_sha256(path: Path, result_kind: str) -> str:
-    if result_kind == "файл":
-        if _is_link(path) or not path.is_file():
-            raise ValueError("Файл результата отсутствует или небезопасен.")
-        return _file_sha256(path)
-    if result_kind == "пакет_pages":
-        if _is_link(path) or not path.is_dir():
-            raise ValueError("Пакет Pages отсутствует или небезопасен.")
-        return directory_sha256(path)
-    raise ValueError("Неизвестный тип собранного результата.")
+def _marker(project_dir: Path) -> Path:
+    return project_dir / PROJECT_MARKER_NAME
 
 
-def _copy_result(source: Path, target: Path, result_kind: str) -> None:
-    if result_kind == "файл":
-        shutil.copy2(source, target)
-    elif result_kind == "пакет_pages":
-        shutil.copytree(source, target)
-    else:
-        raise ValueError("Неизвестный тип собранного результата.")
+def has_project_identity(value: object) -> bool:
+    return isinstance(value, dict) and value.get("тип") == "book-translator" and value.get("схема") == SCHEMA_VERSION
 
 
-def _inside(path: Path, parent: Path) -> bool:
+def is_unsafe_link(path: Path) -> bool:
+    return path.is_symlink()
+
+
+def ensure_project(project_dir: Path) -> dict:
+    project_dir = project_dir.resolve()
     try:
-        path.resolve().relative_to(parent.resolve())
-    except ValueError:
-        return False
-    return True
-
-
-def _remove_within(path: Path, parent: Path) -> None:
-    absolute = Path(path).absolute()
-    parent_absolute = Path(parent).absolute()
-    try:
-        relative = absolute.relative_to(parent_absolute)
-    except ValueError as error:
-        raise ValueError("Отказано в удалении пути вне разрешённого каталога.") from error
-    if not relative.parts:
-        raise ValueError("Отказано в удалении корня разрешённого каталога.")
-    if path.is_symlink():
-        path.unlink(missing_ok=True)
-    elif _is_link(path):
-        path.rmdir() if path.is_dir() else path.unlink(missing_ok=True)
-    elif path.is_file():
-        path.unlink(missing_ok=True)
-    elif path.exists():
-        if not _inside(path, parent):
-            raise ValueError("Отказано в удалении каталога по внешней ссылке.")
-        shutil.rmtree(path)
-
-
-def _validate_state(path: Path) -> None:
-    if not path.is_dir():
-        raise ValueError("Следующая версия памяти не найдена.")
-    missing = [name for name in STATE_ASSETS if not (path / name).is_file()]
-    if missing:
-        raise ValueError("Следующая версия памяти неполна: " + ", ".join(missing) + ".")
-    directory_sha256(path)
-
-
-def _load_json(path: Path, description: str) -> dict:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(_marker(project_dir).read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError(f"Не удалось прочитать {description}.") from error
-    if not isinstance(value, dict):
-        raise ValueError(f"{description} должен содержать объект.")
+        raise ValueError("Каталог не инициализирован для book-translator 0.2; выполните $book-translator-init.") from error
+    if not has_project_identity(value):
+        raise ValueError("Старая или неизвестная схема проекта не поддерживается; создайте новый каталог.")
     return value
 
 
-def _progress_schema_errors(value: dict, require_hashes: bool = False) -> list[str]:
-    missing = [key for key in PROGRESS_KEYS if key not in value]
-    if missing:
-        return ["progress.json неполон: отсутствуют поля " + ", ".join(missing) + "."]
-    errors = []
-    if type(value["версия"]) is not int or value["версия"] != 1:
-        errors.append("Версия progress.json должна быть равна 1.")
-    if not isinstance(value["статус_книги"], str) or value["статус_книги"] not in BOOK_STATUSES:
-        errors.append("progress.json содержит неизвестный статус книги.")
-    if not (
-        value["этап"] is None or isinstance(value["этап"], str)
-    ) or value["этап"] not in KNOWN_STAGES:
-        errors.append("progress.json содержит неизвестный этап.")
-    for key in ("текущая_глава", "последняя_готовая_глава"):
-        chapter = value[key]
-        if chapter is not None:
-            try:
-                _chapter_name(chapter)
-            except ValueError:
-                errors.append(f"Поле «{key}» содержит небезопасное имя главы.")
-    if value["текущая_глава"] is None and value["этап"] is not None:
-        errors.append("Этап указан без текущей главы.")
-    if value["текущая_глава"] is not None and value["этап"] is None:
-        errors.append("Текущая глава указана без этапа.")
-    if value["статус_книги"] == "не_начат" and any(
-        value[key] is not None
-        for key in ("текущая_глава", "этап", "последняя_готовая_глава", "ошибка")
-    ):
-        errors.append("Неначатая книга содержит рабочее состояние.")
-    if value["этап"] == "готово" and (
-        value["текущая_глава"] is None
-        or value["текущая_глава"] != value["последняя_готовая_глава"]
-    ):
-        errors.append("Готовая контрольная точка не согласует текущую и последнюю главы.")
-    if value["статус_книги"] == "готово" and value["этап"] != "готово":
-        errors.append("Готовая книга не находится на этапе «готово».")
-    error = value["ошибка"]
-    if value["статус_книги"] == "ошибка":
-        if not isinstance(error, str) or not error.strip():
-            errors.append("Ошибка обработки не содержит объяснения.")
-    elif error is not None:
-        errors.append("Объяснение ошибки задано без статуса «ошибка».")
-    if require_hashes and value["последняя_готовая_глава"] is not None:
-        for key in ("sha256_результата", "sha256_памяти"):
-            digest = value.get(key)
-            if (
-                not isinstance(digest, str)
-                or len(digest) != 64
-                or any(character not in "0123456789abcdef" for character in digest)
-            ):
-                errors.append(f"progress.json не содержит корректное поле «{key}».")
-    return errors
+def install_agents(project_dir: Path, overwrite: set[str] | None = None) -> list[str]:
+    overwrite = overwrite or set()
+    source_dir = _asset_root() / "agents"
+    target_dir = project_dir / ".codex" / "agents"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    conflicts: list[str] = []
+    for source in sorted(source_dir.glob("*.toml")):
+        target = target_dir / source.name
+        if not target.exists():
+            _copy_atomic(source, target)
+        elif file_sha256(source) != file_sha256(target):
+            if source.name in overwrite:
+                _copy_atomic(source, target)
+            else:
+                conflicts.append(source.name)
+    return conflicts
 
 
-def _validate_next_progress(value: dict, chapter_name: str) -> None:
-    errors = _progress_schema_errors(value)
-    if (
-        value.get("статус_книги") != "в_работе"
-        or value.get("этап") != "готово"
-        or value.get("текущая_глава") != chapter_name
-        or value.get("последняя_готовая_глава") != chapter_name
-        or value.get("ошибка") is not None
-    ):
-        errors.append("Контрольная точка не завершает указанную главу.")
-    if errors:
-        raise ValueError(
-            "Следующая контрольная точка неполна или некорректна: "
-            + " ".join(errors)
-        )
+def initialize_project(project_dir: Path, overwrite_agents: set[str] | None = None) -> dict:
+    project_dir = project_dir.resolve()
+    project_dir.mkdir(parents=True, exist_ok=True)
+    marker_path = _marker(project_dir)
+    if marker_path.exists():
+        marker = ensure_project(project_dir)
+    else:
+        legacy = (project_dir / "progress.json").exists() or (project_dir / "work" / "manifest.json").exists()
+        if legacy:
+            raise ValueError("Обнаружен проект прежней схемы. Автоматическая миграция намеренно не выполняется.")
+        marker = {"тип": "book-translator", "схема": SCHEMA_VERSION, "создан": datetime.now(timezone.utc).isoformat()}
+        _json_atomic(marker_path, marker)
+    for name in ("input", "output", "state", "work"):
+        target = project_dir / name
+        if target.exists() and (not target.is_dir() or target.is_symlink()):
+            raise ValueError(f"Путь {name}/ небезопасен.")
+        target.mkdir(exist_ok=True)
+    assets = _asset_root()
+    config_target = project_dir / "config.ini"
+    if not config_target.exists(): _copy_atomic(assets / "config.ini", config_target)
+    readme_target = project_dir / "TRANSLATION.md"
+    if not readme_target.exists(): _copy_atomic(assets / "project-readme.md", readme_target)
+    for name in STATE_FILES:
+        target = project_dir / "state" / name
+        if not target.exists(): _copy_atomic(assets / name, target)
+    conflicts = install_agents(project_dir, overwrite_agents)
+    progress = project_dir / "progress.json"
+    if not progress.exists():
+        _json_atomic(progress, new_progress())
+    return {"проект": str(project_dir), "конфликты_агентов": conflicts, "маркер": marker}
+
+
+def new_progress() -> dict:
+    return {
+        "схема": SCHEMA_VERSION,
+        "статус_книги": "ожидает-запуска",
+        "этап": "ожидание",
+        "текущий_файл": None,
+        "очередь": [],
+        "файлы": {},
+        "ожидают_одобрения": [],
+        "ошибка": None,
+    }
+
+
+def load_progress(project_dir: Path) -> dict:
+    ensure_project(project_dir)
+    try:
+        value = json.loads((project_dir / "progress.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("progress.json поврежден.") from error
+    if not isinstance(value, dict) or value.get("схема") != SCHEMA_VERSION:
+        raise ValueError("progress.json относится к неподдерживаемой схеме.")
+    return value
+
+
+def save_progress(project_dir: Path, progress: dict) -> None:
+    if progress.get("схема") != SCHEMA_VERSION: raise ValueError("Нельзя записать progress.json другой схемы.")
+    _json_atomic(project_dir / "progress.json", progress)
+
+
+def load_config(project_dir: Path, overrides: dict | None = None) -> dict:
+    ensure_project(project_dir)
+    parser = configparser.ConfigParser()
+    try:
+        with (project_dir / "config.ini").open(encoding="utf-8") as stream: parser.read_file(stream)
+        section = parser["перевод"]
+    except (OSError, KeyError, configparser.Error) as error:
+        raise ValueError("config.ini должен содержать раздел [перевод].") from error
+    config = {
+        "режим": section.get("режим", "продолжить").strip(),
+        "максимум_циклов": section.getint("максимум_циклов", fallback=5),
+        "пользовательская_верификация": section.get("пользовательская_верификация", "в_финале").strip(),
+    }
+    config.update({key: value for key, value in (overrides or {}).items() if value is not None})
+    if config["режим"] not in VALID_MODES: raise ValueError("Неизвестный режим перевода.")
+    if type(config["максимум_циклов"]) is not int or not 1 <= config["максимум_циклов"] <= 20:
+        raise ValueError("максимум_циклов должен быть целым числом от 1 до 20.")
+    if config["пользовательская_верификация"] not in VALID_REVIEW_MODES:
+        raise ValueError("пользовательская_верификация: после-каждого-файла или в-финале.")
+    return config
+
+
+def parse_request_arguments(arguments: list[str]) -> dict:
+    result: dict = {}
+    for argument in arguments:
+        if argument in VALID_MODES: result["режим"] = argument
+        elif argument.startswith("циклы="):
+            value = argument.split("=", 1)[1]
+            if not re.fullmatch(r"\d+", value): raise ValueError("циклы должны быть целым числом от 1 до 20.")
+            result["максимум_циклов"] = int(value)
+        elif argument.startswith("верификация="):
+            result["пользовательская_верификация"] = argument.split("=", 1)[1]
+    if "максимум_циклов" in result and not 1 <= result["максимум_циклов"] <= 20:
+        raise ValueError("циклы должны быть целым числом от 1 до 20.")
+    if result.get("пользовательская_верификация", "в-финале") not in VALID_REVIEW_MODES:
+        raise ValueError("Неизвестный режим пользовательской верификации.")
+    return result
+
+
+def verification_schedule(maximum: int) -> list[dict]:
+    if type(maximum) is not int or not 1 <= maximum <= 20: raise ValueError("Лимит проверок должен быть от 1 до 20.")
+    return [{"раунд": number, "verifier": True, "editor_после": number < maximum} for number in range(1, maximum + 1)]
+
+
+def execute_verification_cycles(draft, maximum: int, verifier, editor) -> tuple[object, list[dict]]:
+    reports: list[dict] = []
+    current = draft
+    for step in verification_schedule(maximum):
+        report = verifier(current, step["раунд"])
+        if not isinstance(report, dict) or not isinstance(report.get("замечания"), list):
+            raise ValueError("Verifier вернул некорректный отчет.")
+        reports.append(report)
+        if not report["замечания"]: break
+        if step["editor_после"]: current = editor(current, report, step["раунд"])
+    return current, reports
+
+
+def record_round(project_dir: Path, chapter_identifier: str, report: dict, edited: bool) -> dict:
+    progress = load_progress(project_dir)
+    item = progress["файлы"].setdefault(chapter_identifier, {"раунды": [], "ревизия": 0})
+    rounds = item.setdefault("раунды", [])
+    rounds.append({"номер": len(rounds) + 1, "отчет": report, "после_правок": bool(edited)})
+    progress["этап"] = "автоматическая-верификация"
+    save_progress(project_dir, progress)
+    return rounds[-1]
+
+
+def _managed_pattern(chapter_identifier: str) -> re.Pattern[str]:
+    escaped = re.escape(chapter_identifier)
+    return re.compile(rf"\n?<!-- managed:file:{escaped}:start -->.*?<!-- managed:file:{escaped}:end -->\n?", re.DOTALL)
+
+
+def prepare_state(project_dir: Path, chapter_identifier: str, destination: Path) -> Path:
+    ensure_project(project_dir)
+    destination.mkdir(parents=True, exist_ok=False)
+    for name in STATE_FILES:
+        source = project_dir / "state" / name
+        text = source.read_text(encoding="utf-8")
+        cleaned = _managed_pattern(chapter_identifier).sub("\n", text)
+        (destination / name).write_text(cleaned, encoding="utf-8")
+    return destination
+
+
+def replace_managed_contribution(state_dir: Path, chapter_identifier: str, contributions: dict[str, str]) -> None:
+    unknown = set(contributions) - set(STATE_FILES)
+    if unknown: raise ValueError("Неизвестные state-файлы: " + ", ".join(sorted(unknown)))
+    for name in STATE_FILES:
+        path = state_dir / name
+        text = path.read_text(encoding="utf-8")
+        text = _managed_pattern(chapter_identifier).sub("\n", text).rstrip() + "\n"
+        contribution = contributions.get(name, "").strip()
+        if contribution:
+            text += f"\n<!-- managed:file:{chapter_identifier}:start -->\n{contribution}\n<!-- managed:file:{chapter_identifier}:end -->\n"
+        path.write_text(text, encoding="utf-8")
+
+
+def resolve_chapter(name: str, entries: list[dict]) -> dict:
+    folded = name.casefold().removesuffix(".rtf")
+    exact = [item for item in entries if item["имя"].casefold().removesuffix(".rtf") == folded]
+    if len(exact) == 1: return exact[0]
+    matches = [item for item in entries if folded in item["имя"].casefold()]
+    if len(matches) == 1: return matches[0]
+    if not matches: raise ValueError(f"Файл «{name}» не найден.")
+    raise ValueError("Имя неоднозначно. Совпадения: " + ", ".join(item["имя"] for item in matches))
+
+
+def output_name(source_name: str, revision: int, timestamp: datetime | None = None) -> str:
+    stem = Path(source_name).stem
+    if revision <= 1: return f"{stem}.ru.rtf"
+    moment = timestamp or datetime.now().astimezone()
+    return f"{stem}.ru.v{revision:03d}.{moment.strftime('%Y%m%d')}.rtf"
+
+
+def _revision_dir(project_dir: Path, chapter_identifier: str, revision: int) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{8,64}", chapter_identifier): raise ValueError("Некорректный идентификатор файла.")
+    return project_dir / "work" / "revisions" / chapter_identifier / f"{revision:03d}"
 
 
 def prepare_transaction(
     project_dir: Path,
-    chapter_name: str,
-    built_document: Path,
-    next_state: Path,
-    next_progress: dict,
-    result_name: str | None = None,
+    chapter: dict,
+    candidate: Path,
+    prepared_state: Path,
+    reports: list[dict] | None = None,
 ) -> Path:
-    project_dir = project_dir.resolve()
-    chapter_name = _chapter_name(chapter_name)
-    result_name = _result_name(built_document.name if result_name is None else result_name)
-    built_document = Path(os.path.abspath(built_document))
-    next_state = next_state.resolve()
-    work_dir = _project_directory(project_dir, "work")
-    if not _inside(built_document, work_dir):
-        raise ValueError("Собранный документ должен находиться внутри work/.")
-    result_kind = _result_kind(built_document, result_name)
-    if result_kind == "файл" and built_document.stat().st_size == 0:
-        raise ValueError("Собранный документ пуст.")
-    result_hash = _result_sha256(built_document, result_kind)
-    if not _inside(next_state, work_dir):
-        raise ValueError("Следующая версия памяти должна находиться внутри work/.")
-    _validate_state(next_state)
-    if not isinstance(next_progress, dict):
-        raise ValueError("Следующая контрольная точка должна быть объектом.")
-    _validate_next_progress(next_progress, chapter_name)
-
-    transactions = _transactions_directory(project_dir, create=True)
-    transaction = transactions / hashlib.sha256(chapter_name.encode("utf-8")).hexdigest()
-    if _is_link(transaction) or transaction.exists():
-        raise ValueError("Путь транзакции этой главы уже существует или небезопасен.")
-    transaction.mkdir()
-    transaction = _transaction_directory(transactions, transaction)
-    output_source = transaction / "new-output" / result_name
-    state_source = transaction / "new-state"
-    (transaction / "new-output").mkdir()
-    (transaction / "backup").mkdir()
-    _copy_result(built_document, output_source, result_kind)
-    shutil.copytree(next_state, state_source)
-    write_json_atomic(transaction / "next-progress.json", dict(next_progress))
-    checkpoint_hash = _file_sha256(transaction / "next-progress.json")
-    write_json_atomic(
-        transaction / "transaction.json",
-        {
-            "исходная_глава": chapter_name,
-            "имя_результата": result_name,
-            "тип_результата": result_kind,
-            "sha256_результата": result_hash,
-            "sha256_памяти": directory_sha256(state_source),
-            "sha256_контрольной_точки": checkpoint_hash,
-        },
-    )
-    _validate_prepared(transaction)
-    _write_text_atomic(transaction / "готово-к-фиксации", "да\n")
-    return transaction
-
-
-def _transaction_for_project(project_dir: Path, transaction_dir: Path) -> Path:
-    transactions = _transactions_directory(project_dir.resolve())
-    if not transactions.is_dir():
-        raise ValueError("Каталог work/transactions/ не найден.")
-    return _transaction_directory(transactions, transaction_dir)
-
-
-def _validate_prepared(transaction: Path) -> dict:
-    metadata_path = _confined_transaction_child(transaction, "transaction.json")
-    metadata = _load_json(metadata_path, "описание транзакции")
-    chapter_name = _chapter_name(metadata.get("исходная_глава", metadata.get("глава")))
-    result_name = _result_name(metadata.get("имя_результата", chapter_name))
-    result_kind = metadata.get("тип_результата", "файл")
-    if result_kind not in {"файл", "пакет_pages"}:
-        raise ValueError("Описание транзакции содержит неизвестный тип результата.")
-    if result_kind == "пакет_pages" and Path(result_name).suffix.casefold() != ".pages":
-        raise ValueError("Пакет Pages должен публиковаться с расширением .pages.")
-    new_output = _confined_transaction_child(transaction, "new-output", directory=True)
-    output = new_output / result_name
-    if _is_link(output) or output.resolve().parent != new_output.resolve():
-        raise ValueError("Подготовленный результат небезопасен.")
-    state = _confined_transaction_child(transaction, "new-state", directory=True)
-    _validate_state(state)
-    checkpoint_path = _confined_transaction_child(transaction, "next-progress.json")
-    next_progress = _load_json(checkpoint_path, "следующую контрольную точку")
-    if _file_sha256(checkpoint_path) != metadata.get(
-        "sha256_контрольной_точки"
-    ):
-        raise ValueError("Подготовленная контрольная точка изменена.")
-    _validate_next_progress(next_progress, chapter_name)
-    if _result_sha256(output, result_kind) != metadata.get("sha256_результата"):
-        raise ValueError("Подготовленный результат повреждён.")
-    if directory_sha256(state) != metadata.get("sha256_памяти"):
-        raise ValueError("Подготовленная память повреждена.")
-    metadata = dict(metadata)
-    metadata.update(
-        {
-            "исходная_глава": chapter_name,
-            "имя_результата": result_name,
-            "тип_результата": result_kind,
-        }
-    )
-    return metadata
-
-
-def _backup_current(project_dir: Path, transaction: Path) -> None:
-    backup = _confined_transaction_child(transaction, "backup", directory=True)
-    ready = _confined_transaction_child(backup, "готово", required=False)
-    if ready.is_file():
-        return
-    temporary = transaction / "backup.tmp"
-    _remove_within(temporary, transaction)
-    temporary.mkdir()
+    ensure_project(project_dir)
+    from documents import inspect_rtf
+    mechanical_errors = inspect_rtf(candidate)
+    if mechanical_errors:
+        raise ValueError("Кандидат не прошел механическую проверку: " + " ".join(mechanical_errors))
+    progress = load_progress(project_dir)
+    identifier = chapter["id"]
+    previous = progress["файлы"].get(identifier, {})
+    revision = int(previous.get("ревизия", 0)) + 1
+    revision_dir = _revision_dir(project_dir, identifier, revision)
+    if revision_dir.exists(): raise ValueError("Каталог этой ревизии уже существует.")
+    revision_dir.mkdir(parents=True)
+    backup = revision_dir / "backup"; backup.mkdir()
+    progress_hash = file_sha256(project_dir / "progress.json")
     state_hash = directory_sha256(project_dir / "state")
-    output_hash = directory_sha256(project_dir / "output")
-    progress_hash = _file_sha256(project_dir / "progress.json")
-    shutil.copytree(project_dir / "state", temporary / "state")
-    shutil.copytree(project_dir / "output", temporary / "output")
-    shutil.copy2(project_dir / "progress.json", temporary / "progress.json")
-    if directory_sha256(temporary / "state") != state_hash:
-        raise ValueError("Не удалось проверить резервную копию памяти.")
-    if directory_sha256(temporary / "output") != output_hash:
-        raise ValueError("Не удалось проверить резервную копию результатов.")
-    if _file_sha256(temporary / "progress.json") != progress_hash:
-        raise ValueError("Не удалось проверить резервную копию progress.json.")
-    _write_text_atomic(temporary / "готово", "да\n")
-    _remove_within(backup, transaction)
-    temporary.replace(backup)
+    shutil.copy2(project_dir / "progress.json", backup / "progress.json")
+    shutil.copytree(project_dir / "state", backup / "state")
+    if file_sha256(backup / "progress.json") != progress_hash or directory_sha256(backup / "state") != state_hash:
+        raise ValueError("Не удалось проверить резервную копию progress или state.")
+    previous_output = previous.get("последний_результат")
+    previous_output_hash = None
+    if isinstance(previous_output, str) and (project_dir / "output" / previous_output).is_file():
+        previous_output_hash = file_sha256(project_dir / "output" / previous_output)
+        shutil.copy2(project_dir / "output" / previous_output, backup / previous_output)
+        if file_sha256(backup / previous_output) != previous_output_hash:
+            raise ValueError("Не удалось проверить резервную копию прежнего перевода.")
+    previous_revision_hash = None
+    if revision > 1:
+        previous_revision = _revision_dir(project_dir, identifier, revision - 1)
+        if not (previous_revision / "завершено").is_file():
+            raise ValueError("Артефакты предыдущей ревизии не подтверждены.")
+        previous_revision_hash = directory_sha256(previous_revision)
+    staged = revision_dir / "candidate.rtf"; shutil.copy2(candidate, staged)
+    shutil.copytree(prepared_state, revision_dir / "prepared-state")
+    if reports is not None: _json_atomic(revision_dir / "verification-reports.json", {"раунды": reports})
+    metadata = {
+        "схема": SCHEMA_VERSION, "id_файла": identifier, "исходник": chapter["имя"],
+        "sha256_исходника": chapter["sha256"], "ревизия": revision,
+        "имя_результата": output_name(chapter["имя"], revision),
+        "sha256_кандидата": file_sha256(staged), "sha256_state": directory_sha256(revision_dir / "prepared-state"),
+        "резервная_копия": {"sha256_progress": progress_hash, "sha256_state": state_hash, "предыдущий_результат": previous_output, "sha256_предыдущего_результата": previous_output_hash, "sha256_предыдущей_ревизии": previous_revision_hash},
+    }
+    _json_atomic(revision_dir / "transaction.json", metadata)
+    (revision_dir / "готово-к-фиксации").write_text("да\n", encoding="utf-8")
+    return revision_dir
 
 
-def _replace_directory(source: Path, target: Path, transaction: Path, label: str) -> None:
-    temporary = target.parent / f".{target.name}-{transaction.name}.tmp"
-    _remove_within(temporary, target.parent)
-    shutil.copytree(source, temporary)
-    if directory_sha256(temporary) != directory_sha256(source):
-        raise ValueError(f"Не удалось проверить временную копию {label}.")
-    previous = transaction / f"до-{label}"
-    if target.exists():
-        if target.is_symlink() or previous.exists():
-            _remove_within(temporary, target.parent)
-            raise ValueError(f"Нельзя безопасно заменить {label}.")
-        target.replace(previous)
-    temporary.replace(target)
+def _restore_backup(project_dir: Path, revision_dir: Path) -> None:
+    backup = revision_dir / "backup"
+    replacement = revision_dir / "restored-state"
+    if replacement.exists(): shutil.rmtree(replacement)
+    shutil.copytree(backup / "state", replacement)
+    old_state = project_dir / "state"
+    failed_state = revision_dir / "failed-state"
+    if old_state.exists(): old_state.replace(failed_state)
+    replacement.replace(old_state)
+    _copy_atomic(backup / "progress.json", project_dir / "progress.json")
 
 
-def _mark_step(transaction: Path, step: str) -> None:
-    _write_text_atomic(transaction / step, "да\n")
-
-
-def _publish_state(project_dir: Path, transaction: Path, metadata: dict) -> None:
-    marker = transaction / "state"
-    target = project_dir / "state"
-    expected = metadata["sha256_памяти"]
-    if target.is_dir() and directory_sha256(target) == expected:
-        if not marker.exists():
-            _mark_step(transaction, "state")
-        return
-    if marker.exists():
-        raise ValueError("Опубликованная память не совпадает с транзакцией.")
-    source = _confined_transaction_child(transaction, "new-state", directory=True)
-    _replace_directory(source, target, transaction, "память")
-    _mark_step(transaction, "state")
-
-
-def _publish_output(project_dir: Path, transaction: Path, metadata: dict) -> None:
-    marker = transaction / "output"
-    result_name = metadata["имя_результата"]
-    result_kind = metadata["тип_результата"]
-    new_output = _confined_transaction_child(transaction, "new-output", directory=True)
-    source = new_output / result_name
-    target = project_dir / "output" / result_name
-    expected = metadata["sha256_результата"]
-    if _is_link(target):
-        raise ValueError("Путь опубликованного результата небезопасен.")
-    target_matches = False
-    if target.exists():
-        try:
-            target_matches = _result_sha256(target, result_kind) == expected
-        except ValueError:
-            target_matches = False
-    if target_matches:
-        if not marker.exists():
-            _mark_step(transaction, "output")
-        return
-    if marker.exists():
-        raise ValueError("Опубликованный результат не совпадает с транзакцией.")
-    if target.exists():
-        raise ValueError("Путь публикации уже занят другим результатом.")
-    temporary = target.parent / f".{result_name}-{transaction.name}.tmp"
-    _remove_within(temporary, target.parent)
-    _copy_result(source, temporary, result_kind)
-    if _result_sha256(temporary, result_kind) != expected:
-        raise ValueError("Не удалось проверить временную копию результата.")
-    temporary.replace(target)
-    _mark_step(transaction, "output")
-
-
-def _publish_progress(project_dir: Path, transaction: Path, metadata: dict) -> None:
-    target = project_dir / "progress.json"
-    checkpoint_path = _confined_transaction_child(transaction, "next-progress.json")
-    next_progress = _load_json(checkpoint_path, "следующую контрольную точку")
-    next_progress["sha256_результата"] = metadata["sha256_результата"]
-    next_progress["sha256_памяти"] = metadata["sha256_памяти"]
-    write_json_atomic(target, next_progress)
-    _mark_step(transaction, "progress")
-
-
-def _restore_backup(project_dir: Path, transaction: Path) -> None:
-    backup = _confined_transaction_child(transaction, "backup", directory=True)
-    _confined_transaction_child(backup, "готово")
-    for name in ("state", "output"):
-        failed = transaction / f"несогласованный-{name}"
-        _remove_within(failed, transaction)
-        target = project_dir / name
-        if target.exists():
-            target.replace(failed)
-        shutil.copytree(backup / name, target)
-    _write_bytes_atomic(
-        project_dir / "progress.json", (backup / "progress.json").read_bytes()
-    )
-    _write_text_atomic(transaction / "отменено", "да\n")
-
-
-def commit_transaction(
-    project_dir: Path,
-    transaction_dir: Path,
-    interrupt_after: str | None = None,
-) -> None:
-    project_dir = project_dir.resolve()
-    for name in ("work", "state", "output"):
-        _project_directory(project_dir, name)
-    if _is_link(project_dir / "progress.json"):
-        raise ValueError("Путь progress.json внутри проекта небезопасен.")
-    transaction = _transaction_for_project(project_dir, transaction_dir)
-    if interrupt_after not in {None, "state", "output"}:
-        raise ValueError("Неизвестная точка прерывания транзакции.")
-    _confined_transaction_child(transaction, "готово-к-фиксации")
-    cancelled = _confined_transaction_child(transaction, "отменено", required=False)
-    if cancelled.exists():
-        raise ValueError("Транзакция отменена после восстановления резервной копии.")
+def commit_transaction(project_dir: Path, revision_dir: Path) -> Path:
+    from documents import extract_annotations, inspect_rtf, rtf_fingerprints
+    metadata = json.loads((revision_dir / "transaction.json").read_text(encoding="utf-8"))
+    candidate = revision_dir / "candidate.rtf"; staged_state = revision_dir / "prepared-state"
+    if file_sha256(candidate) != metadata["sha256_кандидата"] or directory_sha256(staged_state) != metadata["sha256_state"]:
+        raise ValueError("Кандидат или подготовленный state изменились после проверки.")
+    errors = inspect_rtf(candidate)
+    if errors: raise ValueError("Собранный RTF поврежден: " + " ".join(errors))
+    output = project_dir / "output" / metadata["имя_результата"]
+    if output.exists(): raise ValueError("Имя новой ревизии уже занято.")
+    state_swap = revision_dir / "state-to-publish"; shutil.copytree(staged_state, state_swap)
+    old_state = project_dir / "state"; archived_state = revision_dir / "published-state-backup"
     try:
-        metadata = _validate_prepared(transaction)
-        _backup_current(project_dir, transaction)
-        _publish_state(project_dir, transaction, metadata)
-        if interrupt_after == "state":
-            return
-        _publish_output(project_dir, transaction, metadata)
-        if interrupt_after == "output":
-            return
-        _publish_progress(project_dir, transaction, metadata)
-        published = _published_output(
-            project_dir,
-            metadata["имя_результата"],
-            metadata["тип_результата"],
-        )
-        if _result_sha256(published, metadata["тип_результата"]) != metadata["sha256_результата"]:
-            raise ValueError("Контрольная сумма опубликованного результата не совпала.")
-        if directory_sha256(project_dir / "state") != metadata["sha256_памяти"]:
-            raise ValueError("Контрольная сумма опубликованной памяти не совпала.")
-        _write_text_atomic(transaction / "завершено", "да\n")
-    except (OSError, ValueError) as error:
-        backup = _confined_transaction_child(transaction, "backup", directory=True)
-        ready = _confined_transaction_child(backup, "готово", required=False)
-        if ready.is_file():
-            _restore_backup(project_dir, transaction)
-            raise ValueError(
-                f"Транзакция несогласована; опубликованные данные восстановлены: {error}"
-            ) from error
-        raise
+        old_state.replace(archived_state)
+        state_swap.replace(old_state)
+        _copy_atomic(candidate, output)
+        progress = load_progress(project_dir)
+        item = progress["файлы"].setdefault(metadata["id_файла"], {})
+        old_result = item.get("последний_результат")
+        history = item.setdefault("история_результатов", [])
+        if old_result and old_result not in history: history.append(old_result)
+        item.update({
+            "имя": metadata["исходник"], "sha256_исходника": metadata["sha256_исходника"],
+            "ревизия": metadata["ревизия"], "последний_результат": metadata["имя_результата"],
+            "sha256_результата": file_sha256(output), "статус": "ожидает-одобрения",
+            "отпечатки_при_публикации": rtf_fingerprints(output),
+            "аннотации_при_публикации": [note["id"] for note in extract_annotations(output)],
+        })
+        if metadata["id_файла"] not in progress["ожидают_одобрения"]: progress["ожидают_одобрения"].append(metadata["id_файла"])
+        progress["очередь"] = [value for value in progress.get("очередь", []) if value != metadata["id_файла"]]
+        review_mode = progress.get("настройки_запуска", {}).get("пользовательская_верификация", "в-финале")
+        keep_working = review_mode == "в-финале" and bool(progress["очередь"])
+        progress.update({
+            "статус_книги": "в-работе" if keep_working else "ожидает-одобрения",
+            "этап": "подготовка-state" if keep_working else "пользовательская-верификация",
+            "текущий_файл": None if keep_working else metadata["исходник"], "ошибка": None,
+        })
+        save_progress(project_dir, progress)
+        (revision_dir / "завершено").write_text("да\n", encoding="utf-8")
+        return output
+    except Exception as error:
+        output.unlink(missing_ok=True)
+        if old_state.exists(): shutil.rmtree(old_state)
+        if archived_state.exists(): archived_state.replace(old_state)
+        _copy_atomic(revision_dir / "backup" / "progress.json", project_dir / "progress.json")
+        (revision_dir / "откачено").write_text(str(error), encoding="utf-8")
+        raise ValueError(f"Публикация не удалась; предыдущий перевод и state восстановлены: {error}") from error
 
 
-def recover_transaction(project_dir: Path) -> None:
-    project_dir = project_dir.resolve()
-    transactions = _transactions_directory(project_dir)
-    if not transactions.exists():
-        return
-    ready = []
-    for transaction in transactions.iterdir():
-        if _is_link(transaction):
-            raise ValueError("каталог транзакции небезопасен.")
-        if not transaction.is_dir():
+def approve_files(project_dir: Path, identifiers: list[str], strip_callback=None) -> dict:
+    from documents import annotations_only_change, rtf_fingerprints
+    if strip_callback is None:
+        from documents import strip_annotations
+        strip_callback = strip_annotations
+    progress = load_progress(project_dir)
+    for identifier in identifiers:
+        item = progress["файлы"].get(identifier)
+        if not item: raise ValueError(f"Неизвестный файл: {identifier}")
+        result = project_dir / "output" / item["последний_результат"]
+        current = rtf_fingerprints(result)
+        if not annotations_only_change(item.get("отпечатки_при_публикации", {}), current):
+            raise ValueError(f"Основной текст или структура «{result.name}» изменены напрямую.")
+        strip_callback(result)
+        item["sha256_результата"] = file_sha256(result)
+        item["отпечатки_при_публикации"] = rtf_fingerprints(result)
+        item["аннотации_при_публикации"] = []
+        item["статус"] = "одобрен"
+        progress["ожидают_одобрения"] = [value for value in progress["ожидают_одобрения"] if value != identifier]
+    if not progress["ожидают_одобрения"] and not progress["очередь"]:
+        progress.update({"статус_книги": "готово", "этап": "готово", "текущий_файл": None})
+        (project_dir / "work" / "active.json").unlink(missing_ok=True)
+    elif not progress["ожидают_одобрения"] and progress["очередь"]:
+        progress.update({"статус_книги": "в-работе", "этап": "подготовка-state", "текущий_файл": None})
+    save_progress(project_dir, progress)
+    return progress
+
+
+def register_feedback(project_dir: Path, identifier: str, annotation_ids: list[str]) -> list[str]:
+    progress = load_progress(project_dir)
+    item = progress["файлы"].get(identifier)
+    if not item: raise ValueError("Файл для обратной связи не найден.")
+    handled = set(item.setdefault("обработанные_аннотации", []))
+    fresh = [value for value in annotation_ids if value not in handled]
+    item["обработанные_аннотации"].extend(fresh)
+    item["статус"] = "на-доработке"
+    progress.update({"статус_книги": "в-работе", "этап": "учет-замечаний", "текущий_файл": item["имя"]})
+    save_progress(project_dir, progress)
+    return fresh
+
+
+def scan_published_feedback(project_dir: Path, only_identifier: str | None = None) -> tuple[dict[str, list[dict]], list[str]]:
+    from documents import annotations_only_change, extract_annotations, rtf_fingerprints
+    progress = load_progress(project_dir)
+    feedback: dict[str, list[dict]] = {}
+    errors: list[str] = []
+    for identifier, item in progress["файлы"].items():
+        if only_identifier is not None and identifier != only_identifier: continue
+        name = item.get("последний_результат")
+        if not isinstance(name, str): continue
+        path = project_dir / "output" / name
+        if not path.is_file(): errors.append(f"Опубликованный файл «{name}» отсутствует."); continue
+        baseline = item.get("отпечатки_при_публикации", {})
+        current = rtf_fingerprints(path)
+        if not annotations_only_change(baseline, current):
+            errors.append(f"Основной текст или структура «{name}» изменены напрямую.")
             continue
-        transaction = _transaction_directory(transactions, transaction)
-        ready_marker = _confined_transaction_child(
-            transaction, "готово-к-фиксации", required=False
-        )
-        complete_marker = _confined_transaction_child(
-            transaction, "завершено", required=False
-        )
-        cancelled_marker = _confined_transaction_child(
-            transaction, "отменено", required=False
-        )
-        if not ready_marker.is_file():
-            _remove_within(transaction, transactions)
-        elif not complete_marker.is_file() and not cancelled_marker.is_file():
-            ready.append(transaction)
-    if len(ready) > 1:
-        raise ValueError("Найдено несколько незавершённых готовых транзакций.")
-    if ready:
-        commit_transaction(project_dir, ready[0])
+        ignored = set(item.get("аннотации_при_публикации", [])) | set(item.get("обработанные_аннотации", []))
+        fresh = [note for note in extract_annotations(path) if note["id"] not in ignored]
+        if fresh: feedback[identifier] = fresh
+    return feedback, errors
 
 
-def _published_output(
-    project_dir: Path, result_name: str, result_kind: str = "файл"
-) -> Path:
-    output = _project_directory(project_dir, "output")
-    result_name = _result_name(result_name)
-    result = output / result_name
-    if (
-        _is_link(result)
-        or (result_kind == "файл" and not result.is_file())
-        or (result_kind == "пакет_pages" and not result.is_dir())
-        or result_kind not in {"файл", "пакет_pages"}
-        or result.resolve().parent != output.resolve()
-    ):
-        raise ValueError(
-            f"Опубликованный результат «{result_name}» отсутствует или небезопасен."
-        )
-    return result
+def scan_queue(project_dir: Path, allow_changed: str | None = None) -> tuple[dict, list[dict], list[str]]:
+    from documents import build_manifest, discover_chapters, file_sha256 as source_sha256, refresh_manifest
+    ensure_project(project_dir)
+    manifest_path = project_dir / "work" / "manifest.json"
+    progress = load_progress(project_dir)
+    if not manifest_path.exists():
+        manifest = build_manifest(project_dir, discover_chapters(project_dir))
+        queue = [item for item in manifest["главы"] if item["id"] not in progress["файлы"]]
+        return manifest, queue, []
+    try: manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error: raise ValueError("Манифест поврежден.") from error
+    refreshed, new_entries, conflicts = refresh_manifest(project_dir, manifest, allow_changed)
+    by_id = {item["id"]: item for item in refreshed["главы"]}
+    queue = list(new_entries)
+    for identifier, entry in by_id.items():
+        saved = progress["файлы"].get(identifier)
+        if saved is None and entry not in queue: queue.append(entry)
+        elif saved is not None and saved.get("sha256_исходника") != entry["sha256"]:
+            if allow_changed and saved.get("имя", "").casefold() == allow_changed.casefold():
+                if entry not in queue: queue.append(entry)
+            elif not any(saved.get("имя", "") in message for message in conflicts):
+                conflicts.append(f"Исходник «{saved.get('имя')}» изменен; требуется перевести-заново.")
+    if not conflicts:
+        _json_atomic(manifest_path, refreshed)
+    return refreshed, queue, conflicts
 
 
-def _completed_transaction(project_dir: Path, chapter_name: str) -> Path:
-    transactions = _transactions_directory(project_dir)
-    transaction = transactions / hashlib.sha256(chapter_name.encode("utf-8")).hexdigest()
-    if _is_link(transaction):
-        raise ValueError("каталог транзакции небезопасен.")
-    if not transaction.exists():
-        raise ValueError(f"Транзакция главы «{chapter_name}» отсутствует.")
-    transaction = _transaction_directory(transactions, transaction)
-    try:
-        _confined_transaction_child(transaction, "завершено")
-    except ValueError as error:
-        raise ValueError(
-            f"Завершённый маркер транзакции главы «{chapter_name}» отсутствует."
-        ) from error
-    return transaction
+def activate(project_dir: Path, config: dict, queue: list[dict]) -> dict:
+    progress = load_progress(project_dir)
+    progress.update({"статус_книги": "в-работе", "этап": "подготовка-state", "очередь": [item["id"] for item in queue], "настройки_запуска": config, "ошибка": None})
+    save_progress(project_dir, progress)
+    _json_atomic(project_dir / "work" / "active.json", {"тип": "book-translator", "схема": SCHEMA_VERSION, "проект": str(project_dir.resolve())})
+    return progress
 
 
 def check_completed_chapter(project_dir: Path, chapter_name: str) -> list[str]:
-    project_dir = project_dir.resolve()
-    try:
-        chapter_name = _chapter_name(chapter_name)
-        transaction = _completed_transaction(project_dir, chapter_name)
-        metadata = _validate_prepared(transaction)
-        output = _published_output(
-            project_dir,
-            metadata["имя_результата"],
-            metadata["тип_результата"],
-        )
-        actual_hash = _result_sha256(output, metadata["тип_результата"])
-    except (OSError, ValueError) as error:
-        return [str(error)]
-    if metadata.get("исходная_глава") != chapter_name:
-        return [f"Описание транзакции не относится к главе «{chapter_name}»."]
-    if actual_hash != metadata.get("sha256_результата"):
-        return [f"Контрольная сумма опубликованного результата главы «{chapter_name}» не совпадает."]
+    try: progress = load_progress(project_dir)
+    except ValueError as error: return [str(error)]
+    matches = [item for item in progress["файлы"].values() if item.get("имя") == chapter_name]
+    if len(matches) != 1: return [f"Файл «{chapter_name}» не зарегистрирован как завершенный."]
+    item = matches[0]; result = project_dir / "output" / str(item.get("последний_результат", ""))
+    if not result.is_file(): return [f"Результат файла «{chapter_name}» отсутствует."]
+    if file_sha256(result) != item.get("sha256_результата"): return [f"Результат файла «{chapter_name}» изменен напрямую."]
     return []
 
 
 def check_consistency(project_dir: Path) -> list[str]:
-    project_dir = project_dir.resolve()
-    try:
-        state = load_progress(project_dir)
-    except ValueError as error:
-        return [str(error)]
-    errors = _progress_schema_errors(state, require_hashes=True)
-    try:
-        _project_directory(project_dir, "output")
-    except ValueError as error:
-        errors.append(str(error))
-    if errors:
-        return errors
-    chapter_name = state.get("последняя_готовая_глава")
-    if chapter_name:
-        try:
-            chapter_name = _chapter_name(chapter_name)
-        except ValueError as error:
-            return [str(error)]
-        chapter_errors = check_completed_chapter(project_dir, chapter_name)
-        errors.extend(chapter_errors)
-        if not chapter_errors:
-            transaction = _completed_transaction(project_dir, chapter_name)
-            metadata = _validate_prepared(transaction)
-            output = _published_output(
-                project_dir,
-                metadata["имя_результата"],
-                metadata["тип_результата"],
-            )
-            expected_output = state.get("sha256_результата")
-            if _result_sha256(output, metadata["тип_результата"]) != expected_output:
-                errors.append("Контрольная сумма опубликованного результата не совпадает.")
-        expected_state = state.get("sha256_памяти")
-        try:
-            actual_state = directory_sha256(project_dir / "state")
-        except ValueError as error:
-            errors.append(str(error))
-        else:
-            if actual_state != expected_state:
-                errors.append("Контрольная сумма памяти не совпадает.")
+    try: progress = load_progress(project_dir)
+    except ValueError as error: return [str(error)]
+    errors: list[str] = []
+    for item in progress.get("файлы", {}).values():
+        if item.get("статус") in {"одобрен", "ожидает-одобрения"}: errors.extend(check_completed_chapter(project_dir, item.get("имя", "")))
     return errors
 
 
 def finish_book(project_dir: Path) -> None:
-    project_dir = project_dir.resolve()
-    work_dir = _project_directory(project_dir, "work")
-    state = load_progress(project_dir)
-    if state.get("статус_книги") == "ошибка" or state.get("ошибка"):
-        raise ValueError("Книгу нельзя завершить при зафиксированной ошибке.")
-    if state.get("этап") != "готово" or not state.get("текущая_глава"):
-        raise ValueError("Текущая глава не завершена.")
-    manifest_path = work_dir / "manifest.json"
-    if manifest_path.is_file():
-        manifest = _load_json(manifest_path, "манифест глав")
-        chapters = manifest.get("главы")
-        if not isinstance(chapters, list):
-            raise ValueError("Манифест не содержит список глав.")
-        if any(
-            not isinstance(chapter, dict) or not isinstance(chapter.get("имя"), str)
-            for chapter in chapters
-        ):
-            raise ValueError("Манифест содержит некорректную главу.")
-        names = [chapter["имя"] for chapter in chapters]
-        last_ready = state.get("последняя_готовая_глава")
-        if not names or last_ready not in names or names[-1] != last_ready:
-            raise ValueError("В книге остались необработанные главы.")
-        for chapter_name in names:
-            errors = check_completed_chapter(project_dir, chapter_name)
-            if errors:
-                raise ValueError(f"Глава «{chapter_name}» не готова: {' '.join(errors)}")
-    errors = check_consistency(project_dir)
-    if errors:
-        raise ValueError("Проект несогласован: " + " ".join(errors))
-    state["статус_книги"] = "готово"
-    write_json_atomic(project_dir / "progress.json", state)
-    (work_dir / "active.json").unlink(missing_ok=True)
-
-
-def _restart_paths(project_dir: Path) -> list[Path]:
-    paths = [project_dir / "output", project_dir / "state", project_dir / "progress.json"]
-    work = _project_directory(project_dir, "work")
-    if work.is_dir():
-        paths.extend(path for path in work.iterdir() if path.name != "restarts")
-    return paths
+    progress = load_progress(project_dir)
+    if progress["очередь"] or progress["ожидают_одобрения"]: raise ValueError("Проект нельзя завершить до обработки очереди и явного одобрения.")
+    if check_consistency(project_dir): raise ValueError("Проект несогласован.")
+    progress.update({"статус_книги": "готово", "этап": "готово", "текущий_файл": None})
+    save_progress(project_dir, progress)
+    (project_dir / "work" / "active.json").unlink(missing_ok=True)
 
 
 def restart_project(project_dir: Path, confirmed: bool = False) -> list[Path] | Path:
-    project_dir = project_dir.resolve()
-    for name in ("output", "state", "work"):
-        _project_directory(project_dir, name)
-    affected = _restart_paths(project_dir)
-    if not confirmed:
-        return affected
-    for path in affected:
-        candidates = [path]
-        if path.is_dir() and not _is_link(path):
-            candidates.extend(path.rglob("*"))
-        if any(_is_link(candidate) for candidate in candidates):
-            raise ValueError(f"Нельзя безопасно перезапустить проект: {path.name} небезопасен.")
+    ensure_project(project_dir)
+    affected = [project_dir / "output", project_dir / "state", project_dir / "progress.json", project_dir / "work"]
+    if not confirmed: return affected
+    for root in affected:
+        candidates = [root, *(root.rglob("*") if root.is_dir() else [])]
+        if any(path.is_symlink() for path in candidates): raise ValueError(f"Нельзя безопасно очистить {root.name}: найден символический путь.")
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     backup = project_dir / "work" / "restarts" / timestamp
     backup.mkdir(parents=True)
-    output_hash = directory_sha256(project_dir / "output")
-    state_hash = directory_sha256(project_dir / "state")
-    progress_hash = _file_sha256(project_dir / "progress.json")
     shutil.copytree(project_dir / "output", backup / "output")
     shutil.copytree(project_dir / "state", backup / "state")
     shutil.copy2(project_dir / "progress.json", backup / "progress.json")
-    work_backup = backup / "work"
-    work_backup.mkdir()
-    for path in affected[3:]:
-        target = work_backup / path.name
-        if path.is_dir():
-            shutil.copytree(path, target)
-        elif path.is_file():
-            shutil.copy2(path, target)
-    if directory_sha256(backup / "output") != output_hash:
-        raise ValueError("Не удалось проверить резервную копию результатов.")
-    if directory_sha256(backup / "state") != state_hash:
-        raise ValueError("Не удалось проверить резервную копию памяти.")
-    if _file_sha256(backup / "progress.json") != progress_hash:
-        raise ValueError("Не удалось проверить резервную копию progress.json.")
-    for path in affected:
-        _remove_within(path, project_dir)
+    work_backup = backup / "work"; work_backup.mkdir()
+    for item in (project_dir / "work").iterdir():
+        if item.name == "restarts": continue
+        if item.is_dir(): shutil.copytree(item, work_backup / item.name)
+        elif item.is_file(): shutil.copy2(item, work_backup / item.name)
+    for item in (project_dir / "output").iterdir():
+        if item.is_dir(): shutil.rmtree(item)
+        else: item.unlink()
+    for item in (project_dir / "state").iterdir():
+        if item.is_dir(): shutil.rmtree(item)
+        else: item.unlink()
+    for item in list((project_dir / "work").iterdir()):
+        if item.name == "restarts": continue
+        if item.is_dir(): shutil.rmtree(item)
+        else: item.unlink()
+    (project_dir / "progress.json").unlink()
     initialize_project(project_dir)
     return backup

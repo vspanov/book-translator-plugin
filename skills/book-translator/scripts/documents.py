@@ -1,764 +1,623 @@
 from __future__ import annotations
 
+import codecs
 import hashlib
-import importlib.metadata
 import json
-import platform
 import re
-import subprocess
-import sys
-import tempfile
-import zipfile
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from xml.etree import ElementTree
+from typing import Iterable
 
-SUPPORTED_SUFFIXES = {".docx", ".pages"}
-EXCLUDED_DIRECTORIES = {"output", "state", "work"}
-W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-UNSUPPORTED_PARTS = {
-    "word/comments.xml": "Документ содержит комментарии.",
-    "word/people.xml": "Документ содержит данные совместного редактирования.",
+
+SUPPORTED_SUFFIXES = {".rtf"}
+EXCLUDED_DIRECTORIES = {"output", "state", "work", ".codex"}
+UNSAFE_DESTINATIONS = {"field", "header", "footer", "object", "shptxt", "txbx"}
+UNSAFE_CONTROLS = {"trowd", "cell", "row", "nesttableprops"}
+SKIPPED_DESTINATIONS = {
+    "fonttbl", "colortbl", "stylesheet", "info", "pict", "object", "filetbl",
+    "listtable", "listoverridetable", "generator", "xmlnstbl", "datastore",
+    "themedata", "colorschememapping", "latentstyles", "rsidtbl", "fldinst",
+    "atrfstart", "atrfend", "atnid", "atnauthor", "annotation", "atnref",
 }
-UNSUPPORTED_XML = {
-    "ins": "Документ содержит отслеживаемые вставки.",
-    "del": "Документ содержит отслеживаемые удаления.",
-    "txbxContent": "Документ содержит связанные текстовые блоки.",
-    "hyperlink": "Документ содержит гиперссылки, которые первая версия не переводит безопасно.",
-}
+DESTINATION_WORDS = SKIPPED_DESTINATIONS | UNSAFE_DESTINATIONS | {"footnote"}
 
 
-def normalize_output_format(output_format: str) -> str | None:
-    if not isinstance(output_format, str):
-        return None
-    selected = output_format.strip().casefold()
-    if selected in {
-        "как-в-оригинале",
-        "как_в_оригинале",
-        "как в оригинале",
-        "оригинал",
-        "original",
-    }:
-        return "original"
-    if selected in {"docx", ".docx"}:
-        return "docx"
-    if selected in {"pages", ".pages"}:
-        return "pages"
-    return None
+@dataclass(frozen=True)
+class Token:
+    kind: str
+    raw: str
+    start: int
+    end: int
+    word: str | None = None
+    parameter: int | None = None
 
 
-def preflight_formats(
-    input_suffixes: set[str], output_format: str, system: str, pages_available: bool
-) -> list[str]:
-    normalized = normalize_output_format(output_format)
-    if normalized is None:
-        return [f"Неподдерживаемый выходной формат: {output_format}."]
-    wants_pages = ".pages" in {suffix.casefold() for suffix in input_suffixes} or normalized == "pages"
-    if system == "Windows" and wants_pages:
-        return ["Windows не поддерживает Pages: используйте Mac с Pages или сохраните документ как DOCX."]
-    if system == "Darwin" and wants_pages and not pages_available:
-        return ["Приложение Pages не найдено на этом Mac."]
-    if system not in {"Windows", "Darwin"}:
-        return [f"Операционная система {system} не поддерживается первой версией плагина."]
-    return []
+@dataclass
+class Group:
+    start: int
+    end: int = 0
+    destination: str | None = None
+    parameter: int | None = None
+    tokens: list[Token] = field(default_factory=list)
 
 
-def preflight_python(version: tuple[int, int, int]) -> list[str]:
-    if version < (3, 10, 0):
-        return [f"Python {version[0]}.{version[1]} не поддерживается; требуется Python 3.10 или новее."]
-    return []
+@dataclass
+class FormatState:
+    destination: str = "body"
+    bold: bool = False
+    italic: bool = False
+    outline: int | None = None
+    codepage: int = 1252
+    uc: int = 1
+    skip_fallback: int = 0
 
 
-def preflight_dependency(version: str | None) -> list[str]:
-    if version is None:
-        return ["Пакет python-docx не найден. Покажите команду установки и запросите разрешение пользователя."]
-    match = re.match(r"^(\d+)\.(\d+)", version)
-    if match is None or int(match.group(1)) != 1 or int(match.group(2)) < 2:
-        return [f"Версия python-docx {version} не поддерживается; требуется 1.2 или новее, но ниже 2.0."]
-    return []
+@dataclass
+class Atom:
+    text: str
+    start: int
+    end: int
+    bold: bool
+    italic: bool
+    destination: str
 
 
-def runtime_report() -> dict[str, str | None]:
+def tokenize_rtf(raw: str) -> list[Token]:
+    tokens: list[Token] = []
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if char == "{":
+            tokens.append(Token("group_start", char, index, index + 1))
+            index += 1
+        elif char == "}":
+            tokens.append(Token("group_end", char, index, index + 1))
+            index += 1
+        elif char == "\\":
+            start = index
+            index += 1
+            if index >= len(raw):
+                raise ValueError("RTF оканчивается незавершенным управляющим символом.")
+            marker = raw[index]
+            if marker == "'":
+                if index + 2 >= len(raw) or not re.fullmatch(r"[0-9a-fA-F]{2}", raw[index + 1:index + 3]):
+                    raise ValueError("В RTF найден некорректный шестнадцатеричный символ.")
+                index += 3
+                tokens.append(Token("hex", raw[start:index], start, index))
+            elif marker.isalpha():
+                match = re.match(r"([A-Za-z]+)(-?\d+)? ?", raw[index:])
+                if match is None:
+                    raise ValueError("В RTF найден некорректный управляющий код.")
+                index += len(match.group(0))
+                parameter = int(match.group(2)) if match.group(2) is not None else None
+                word = match.group(1)
+                tokens.append(Token("control", raw[start:index], start, index, word, parameter))
+                if word == "bin":
+                    if parameter is None or parameter < 0 or index + parameter > len(raw):
+                        raise ValueError("В RTF найден некорректный бинарный блок.")
+                    tokens.append(Token("binary", raw[index:index + parameter], index, index + parameter))
+                    index += parameter
+            else:
+                index += 1
+                tokens.append(Token("symbol", raw[start:index], start, index, marker))
+        else:
+            start = index
+            while index < len(raw) and raw[index] not in "{}\\":
+                index += 1
+            tokens.append(Token("text", raw[start:index], start, index))
+    return tokens
+
+
+def _group_index(tokens: list[Token]) -> list[Group]:
+    stack: list[Group] = []
+    groups: list[Group] = []
+    for token in tokens:
+        if token.kind == "group_start":
+            stack.append(Group(token.start))
+            continue
+        if not stack:
+            if token.kind == "text" and not token.raw.strip():
+                continue
+            raise ValueError("RTF содержит данные вне корневой группы.")
+        stack[-1].tokens.append(token)
+        if token.kind == "control" and stack[-1].destination is None and token.word in DESTINATION_WORDS:
+            stack[-1].destination = token.word
+            stack[-1].parameter = token.parameter
+        if token.kind == "group_end":
+            group = stack.pop()
+            group.end = token.end
+            groups.append(group)
+    if stack:
+        raise ValueError("RTF содержит незакрытую группу.")
+    roots = [group for group in groups if group.start == 0]
+    if len(roots) != 1:
+        raise ValueError("RTF должен содержать одну корневую группу.")
+    return groups
+
+
+def _decode_hex(raw: str, codepage: int) -> str:
+    value = bytes([int(raw[-2:], 16)])
     try:
-        dependency_version = importlib.metadata.version("python-docx")
-    except importlib.metadata.PackageNotFoundError:
-        dependency_version = None
+        return value.decode(f"cp{codepage}")
+    except (LookupError, UnicodeDecodeError):
+        return value.decode("cp1252", errors="replace")
+
+
+def _decode_plain_segments(raw: str, codepage: int) -> list[tuple[str, int, int]]:
+    try: decoder = codecs.getincrementaldecoder(f"cp{codepage}")(errors="replace")
+    except LookupError: decoder = codecs.getincrementaldecoder("cp1252")(errors="replace")
+    data = raw.encode("latin-1")
+    result: list[tuple[str, int, int]] = []
+    sequence_start = 0
+    for index, byte in enumerate(data):
+        decoded = decoder.decode(bytes([byte]), final=False)
+        if decoded:
+            result.extend((character, sequence_start, index + 1) for character in decoded)
+            sequence_start = index + 1
+    tail = decoder.decode(b"", final=True)
+    result.extend((character, sequence_start, len(data)) for character in tail)
+    return result
+
+
+def _unicode(parameter: int | None) -> str:
+    if parameter is None:
+        return ""
+    value = parameter if parameter >= 0 else parameter + 65536
+    return chr(value)
+
+
+def _symbol_text(word: str | None) -> str:
+    return {"~": "\u00a0", "-": "\u00ad", "_": "\u2011", "\\": "\\", "{": "{", "}": "}"}.get(word, "")
+
+
+def _control_text(word: str | None) -> str:
     return {
-        "python": sys.executable,
-        "python_version": platform.python_version(),
-        "python_docx": dependency_version,
+        "par": "\n", "line": "\n", "tab": "\t", "emdash": "\u2014",
+        "endash": "\u2013", "bullet": "\u2022", "lquote": "\u2018",
+        "rquote": "\u2019", "ldblquote": "\u201c", "rdblquote": "\u201d",
+    }.get(word, "")
+
+
+def _parse_atoms(raw: str, tokens: list[Token]) -> tuple[list[Atom], list[dict]]:
+    states = [FormatState()]
+    atoms: list[Atom] = []
+    blocks: list[dict] = []
+    paragraphs: dict[str, list[Atom]] = {"body": [], "footnote": []}
+
+    def finish(destination: str) -> None:
+        paragraph = paragraphs[destination]
+        text = "".join(atom.text for atom in paragraph)
+        if text or paragraph:
+            outline = states[-1].outline
+            kind = "сноска" if destination == "footnote" else "заголовок" if outline is not None else ("разрыв_сцены" if text.strip() in {"***", "* * *", "— — —"} else "абзац")
+            blocks.append({
+                "номер": len(blocks) + 1,
+                "тип": kind,
+                "текст": text,
+                "фрагменты": _fragments(paragraph),
+                "исходные_диапазоны": [[atom.start, atom.end] for atom in paragraph],
+            })
+        paragraphs[destination] = []
+
+    for token in tokens:
+        if token.kind == "group_start":
+            states.append(replace(states[-1]))
+            continue
+        if token.kind == "group_end":
+            if len(states) == 1:
+                raise ValueError("RTF содержит лишнюю закрывающую скобку.")
+            if states[-1].destination == "footnote" and paragraphs["footnote"]:
+                finish("footnote")
+            states.pop()
+            continue
+        state = states[-1]
+        if token.kind == "symbol" and token.word == "*":
+            state.destination = "ignorable"
+            continue
+        if token.kind == "control":
+            if token.word in DESTINATION_WORDS:
+                state.destination = token.word or state.destination
+                continue
+            if token.word == "ansicpg" and token.parameter:
+                state.codepage = token.parameter
+            elif token.word == "uc" and token.parameter is not None:
+                state.uc = max(0, token.parameter)
+            elif token.word == "u":
+                if state.destination in {"body", "footnote"}:
+                    atom = Atom(_unicode(token.parameter), token.start, token.end, state.bold, state.italic, state.destination)
+                    atoms.append(atom); paragraphs[state.destination].append(atom)
+                state.skip_fallback = state.uc
+            elif token.word in {"b", "i"}:
+                setattr(state, "bold" if token.word == "b" else "italic", token.parameter != 0)
+            elif token.word == "plain":
+                state.bold = state.italic = False
+            elif token.word == "outlinelevel":
+                state.outline = token.parameter
+            elif token.word == "par" and state.destination in {"body", "footnote"}:
+                finish(state.destination)
+            else:
+                value = _control_text(token.word)
+                if value and state.destination in {"body", "footnote"}:
+                    atom = Atom(value, token.start, token.end, state.bold, state.italic, state.destination)
+                    atoms.append(atom); paragraphs[state.destination].append(atom)
+            continue
+        if state.destination not in {"body", "footnote"}:
+            continue
+        if token.kind == "text":
+            segments = _decode_plain_segments(token.raw, state.codepage)
+            dropped_segments = segments[:state.skip_fallback]
+            if dropped_segments and atoms: atoms[-1].end = token.start + dropped_segments[-1][2]
+            state.skip_fallback = max(0, state.skip_fallback - len(segments))
+            for character, local_start, local_end in segments[len(dropped_segments):]:
+                if character in "\r\n": continue
+                atom = Atom(character, token.start + local_start, token.start + local_end, state.bold, state.italic, state.destination)
+                atoms.append(atom); paragraphs[state.destination].append(atom)
+            continue
+        value = _decode_hex(token.raw, state.codepage) if token.kind == "hex" else _symbol_text(token.word)
+        dropped = 0
+        if state.skip_fallback:
+            dropped = min(len(value), state.skip_fallback)
+            value = value[dropped:]
+            state.skip_fallback -= dropped
+            if dropped and atoms:
+                atoms[-1].end = token.start + dropped if token.kind == "text" else token.end
+        for character in value:
+            atom = Atom(character, token.start, token.end, state.bold, state.italic, state.destination)
+            atoms.append(atom); paragraphs[state.destination].append(atom)
+    for destination in ("body", "footnote"):
+        if paragraphs[destination]: finish(destination)
+    return atoms, blocks
+
+
+def _fragments(atoms: list[Atom]) -> list[dict]:
+    fragments: list[dict] = []
+    for atom in atoms:
+        if fragments and fragments[-1]["полужирный"] == atom.bold and fragments[-1]["курсив"] == atom.italic:
+            fragments[-1]["текст"] += atom.text
+        else:
+            fragments.append({"текст": atom.text, "полужирный": atom.bold, "курсив": atom.italic})
+    return fragments
+
+
+def _group_text(group: Group, codepage: int = 1252) -> str:
+    result: list[str] = []
+    skip = 0
+    uc = 1
+    for token in group.tokens:
+        if token.kind == "control" and token.word == "uc" and token.parameter is not None:
+            uc = max(0, token.parameter)
+        elif token.kind == "control" and token.word == "u":
+            result.append(_unicode(token.parameter)); skip = uc
+        elif token.kind == "hex":
+            value = _decode_hex(token.raw, codepage)
+            if skip: skip -= 1
+            else: result.append(value)
+        elif token.kind == "text":
+            value = "".join(character for character, _, _ in _decode_plain_segments(token.raw, codepage) if character not in "\r\n")
+            if skip:
+                value = value[skip:]; skip = 0
+            result.append(value)
+        elif token.kind == "symbol":
+            value = _symbol_text(token.word)
+            if skip: skip -= 1
+            else: result.append(value)
+        elif token.kind == "control":
+            result.append(_control_text(token.word))
+    return "".join(result).strip()
+
+
+def extract_annotations(path_or_raw: Path | str) -> list[dict]:
+    raw = path_or_raw.read_text(encoding="latin-1") if isinstance(path_or_raw, Path) else path_or_raw
+    tokens = tokenize_rtf(raw)
+    groups = _group_index(tokens)
+    starts: dict[str, int] = {}
+    ends: dict[str, int] = {}
+    authors: list[str] = []
+    identifiers: list[str] = []
+    references: list[str] = []
+    notes: list[str] = []
+    for group in sorted(groups, key=lambda item: item.start):
+        text = _group_text(group)
+        if group.destination == "atrfstart": starts[text] = group.end
+        elif group.destination == "atrfend": ends[text] = group.start
+        elif group.destination == "atnauthor": authors.append(text)
+        elif group.destination == "atnid": identifiers.append(text)
+        elif group.destination == "atnref": references.append(str(group.parameter) if group.parameter is not None else text)
+        elif group.destination == "annotation": notes.append(text)
+    count = max(len(notes), len(identifiers), len(references), 0)
+    result = []
+    for index in range(count):
+        reference = references[index] if index < len(references) else (identifiers[index] if index < len(identifiers) else str(index + 1))
+        identifier = identifiers[index] if index < len(identifiers) else reference
+        start, end = starts.get(reference), ends.get(reference)
+        quote = _plain_range(raw, start, end) if start is not None and end is not None and start <= end else ""
+        result.append({
+            "id": identifier,
+            "ссылка": reference,
+            "автор": authors[index] if index < len(authors) else "Пользователь",
+            "текст": notes[index] if index < len(notes) else "",
+            "цитата": quote,
+            "начало": start,
+            "конец": end,
+        })
+    return result
+
+
+def _plain_range(raw: str, start: int, end: int) -> str:
+    atoms, _ = _parse_atoms(raw, tokenize_rtf(raw))
+    return "".join(atom.text for atom in atoms if atom.start >= start and atom.end <= end).strip()
+
+
+def inspect_rtf(path: Path) -> list[str]:
+    if path.suffix.casefold() != ".rtf":
+        return ["Поддерживается только формат .rtf."]
+    try:
+        raw = path.read_text(encoding="latin-1")
+        tokens = tokenize_rtf(raw)
+        groups = _group_index(tokens)
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        return [f"RTF нельзя безопасно разобрать: {error}"]
+    if not re.match(r"^\{\\rtf1(?:\D|$)", raw):
+        return ["Файл не является RTF версии 1."]
+    unsafe = sorted({group.destination for group in groups if group.destination in UNSAFE_DESTINATIONS})
+    unsafe.extend(sorted({token.word for token in tokens if token.kind == "control" and token.word in UNSAFE_CONTROLS}))
+    return [f"RTF содержит неподдерживаемую текстовую конструкцию: {name}." for name in sorted(set(unsafe))]
+
+
+def extract_rtf(path: Path) -> dict:
+    errors = inspect_rtf(path)
+    if errors:
+        raise ValueError(" ".join(errors))
+    raw = path.read_text(encoding="latin-1")
+    _, blocks = _parse_atoms(raw, tokenize_rtf(raw))
+    return {
+        "формат": "rtf",
+        "исходный_файл": path.name,
+        "блоки": blocks,
+        "аннотации": extract_annotations(raw),
     }
 
 
-def run_pages_bridge(mode: str, source: Path, destination: Path, allowed: bool) -> None:
-    if not allowed:
-        raise PermissionError("Для запуска Pages требуется явное разрешение пользователя.")
-    if mode not in {"export", "import"}:
-        raise ValueError("Направление Pages должно быть export или import.")
-    if not source.exists():
-        raise FileNotFoundError(f"Исходный документ Pages не найден: {source}.")
-    expected_suffixes = {
-        "export": (".pages", ".docx"),
-        "import": (".docx", ".pages"),
+def split_blocks(path: Path) -> list[dict]:
+    return extract_rtf(path)["блоки"]
+
+
+def _escape_text(text: str) -> str:
+    result: list[str] = []
+    for character in text:
+        if character in "{}\\":
+            result.append("\\" + character)
+        elif character == "\n":
+            result.append("\\line ")
+        elif character == "\t":
+            result.append("\\tab ")
+        elif 32 <= ord(character) <= 126:
+            result.append(character)
+        else:
+            value = ord(character)
+            if value > 32767: value -= 65536
+            result.append(f"\\u{value}?")
+    return "".join(result)
+
+
+def _render_fragments(block: dict) -> str:
+    fragments = block.get("фрагменты")
+    if not isinstance(fragments, list):
+        fragments = [{"текст": block.get("текст", ""), "полужирный": False, "курсив": False}]
+    rendered = ["{\\plain "]
+    bold = italic = False
+    for fragment in fragments:
+        next_bold = bool(fragment.get("полужирный")); next_italic = bool(fragment.get("курсив"))
+        if next_bold != bold: rendered.append("\\b " if next_bold else "\\b0 "); bold = next_bold
+        if next_italic != italic: rendered.append("\\i " if next_italic else "\\i0 "); italic = next_italic
+        rendered.append(_escape_text(str(fragment.get("текст", ""))))
+    rendered.append("}")
+    return "".join(rendered)
+
+
+def rebuild_rtf(source: Path, translated: dict | list[dict], destination: Path) -> None:
+    errors = inspect_rtf(source)
+    if errors: raise ValueError(" ".join(errors))
+    original = extract_rtf(source)
+    blocks = translated.get("блоки") if isinstance(translated, dict) else translated
+    if not isinstance(blocks, list) or len(blocks) != len(original["блоки"]):
+        raise ValueError("Количество блоков перевода не совпадает с оригиналом.")
+    replacements: list[tuple[int, int, str]] = []
+    for source_block, target_block in zip(original["блоки"], blocks, strict=True):
+        source_formats = [(item["полужирный"], item["курсив"]) for item in source_block["фрагменты"]]
+        target_fragments = target_block.get("фрагменты") if isinstance(target_block, dict) else None
+        if not isinstance(target_fragments, list):
+            raise ValueError("Каждый блок перевода должен содержать фрагменты форматирования.")
+        target_formats = [(bool(item.get("полужирный")), bool(item.get("курсив"))) for item in target_fragments]
+        if source_formats != target_formats:
+            raise ValueError("Перевод изменяет количество или типы форматирующих фрагментов.")
+        spans = source_block["исходные_диапазоны"]
+        if not spans:
+            continue
+        first_start = spans[0][0]
+        replacements.append((first_start, spans[0][1], _render_fragments(target_block)))
+        replacements.extend((start, end, "") for start, end in spans[1:])
+    raw = source.read_text(encoding="latin-1")
+    for start, end, value in sorted(replacements, reverse=True):
+        raw = raw[:start] + value + raw[end:]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".tmp.rtf")
+    temporary.write_text(raw, encoding="latin-1")
+    if inspect_rtf(temporary):
+        temporary.unlink(missing_ok=True)
+        raise ValueError("Собранный RTF не прошел механическую проверку.")
+    temporary.replace(destination)
+
+
+def _annotation_id(issue: dict, index: int) -> str:
+    explicit = issue.get("id")
+    if isinstance(explicit, str) and explicit.strip():
+        return re.sub(r"[^A-Za-z0-9_-]", "-", explicit.strip())[:64]
+    stable = json.dumps(issue, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return "bt-" + hashlib.sha256(stable).hexdigest()[:16] + f"-{index}"
+
+
+def chat_feedback_to_issue(quote: str, message: str, block: int, occurrence: int = 1) -> dict:
+    if not quote.strip() or not message.strip():
+        raise ValueError("Замечание из чата требует выделенной цитаты и описания.")
+    seed = json.dumps([quote, message, block, occurrence], ensure_ascii=False).encode("utf-8")
+    return {
+        "id": "chat-" + hashlib.sha256(seed).hexdigest()[:16],
+        "блок": block,
+        "точная_цитата": quote,
+        "номер_вхождения": occurrence,
+        "серьезность": "пользовательская",
+        "объяснение": message,
+        "минимальная_рекомендация": "Учесть формулировку пользователя.",
     }
-    source_suffix, destination_suffix = expected_suffixes[mode]
-    if source.suffix.casefold() != source_suffix or destination.suffix.casefold() != destination_suffix:
-        raise ValueError(
-            f"Неподходящий формат для {mode}: ожидаются {source_suffix} и {destination_suffix}."
-        )
-    if destination.exists():
-        raise FileExistsError(f"Итоговый документ уже существует: {destination}.")
-    script = Path(__file__).with_name("pages-bridge.applescript")
-    try:
-        completed = subprocess.run(
-            ["osascript", str(script), mode, str(source.resolve()), str(destination.resolve())],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-    except OSError as error:
-        raise RuntimeError(f"Не удалось запустить Pages: {error}") from error
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip() or "неизвестная ошибка"
-        raise RuntimeError(f"Pages не смог обработать документ: {detail}")
-    try:
-        has_result = any(destination.iterdir()) if destination.is_dir() else destination.is_file() and destination.stat().st_size > 0
-    except OSError:
-        has_result = False
-    if not has_result:
-        raise RuntimeError("Pages не создал итоговый документ или результат пуст.")
 
 
-def natural_key(path: Path) -> tuple:
-    return tuple(
-        int(part) if part.isdigit() else part.casefold()
-        for part in re.split(r"(\d+)", path.name)
-    )
+def _issue_positions(raw: str, issue: dict) -> tuple[int, int]:
+    quote = issue.get("точная_цитата") or issue.get("цитата")
+    occurrence = issue.get("номер_вхождения", 1)
+    if not isinstance(quote, str) or not quote:
+        raise ValueError("Для аннотации требуется точная цитата.")
+    plain_atoms, _ = _parse_atoms(raw, tokenize_rtf(raw))
+    plain = "".join(atom.text for atom in plain_atoms)
+    try: occurrence = int(occurrence)
+    except (TypeError, ValueError): occurrence = 1
+    cursor = -1
+    for _ in range(max(1, occurrence)):
+        cursor = plain.find(quote, cursor + 1)
+        if cursor < 0: raise ValueError(f"Цитата для аннотации не найдена: {quote!r}.")
+    selected = plain_atoms[cursor:cursor + len(quote)]
+    if not selected or "".join(atom.text for atom in selected) != quote:
+        raise ValueError("Цитату нельзя однозначно привязать к RTF.")
+    return selected[0].start, selected[-1].end
 
 
-def discover_chapters(project_dir: Path) -> list[Path]:
-    project_dir = project_dir.resolve()
-    input_dir = project_dir / "input"
-    root_files = [
-        path
-        for path in project_dir.iterdir()
-        if path.is_file() and path.suffix.casefold() in SUPPORTED_SUFFIXES
-    ]
-    input_files = [] if not input_dir.is_dir() else [
-        path
-        for path in input_dir.iterdir()
-        if path.is_file() and path.suffix.casefold() in SUPPORTED_SUFFIXES
-    ]
-    if root_files and input_files:
-        raise ValueError(
-            "Поддерживаемые документы найдены одновременно в input/ и корне проекта."
-        )
-    chapters = input_files or root_files
-    folded = [path.stem.casefold() for path in chapters]
-    if len(folded) != len(set(folded)):
-        raise ValueError("Имена глав неоднозначны с учётом регистра.")
-    keys = [natural_key(path) for path in chapters]
-    if len(keys) != len(set(keys)):
-        raise ValueError("Порядок глав неоднозначен из-за совпадающих числовых частей.")
-    if not chapters:
-        raise ValueError("Поддерживаемые главы .docx или .pages не найдены.")
-    return sorted(chapters, key=natural_key)
+def add_annotations(source: Path, issues: Iterable[dict], destination: Path | None = None) -> Path:
+    raw = source.read_text(encoding="latin-1")
+    additions: list[tuple[int, str]] = []
+    for index, issue in enumerate(issues, start=1):
+        start, end = _issue_positions(raw, issue)
+        identifier = _annotation_id(issue, index)
+        reference = int(hashlib.sha256(identifier.encode()).hexdigest()[:7], 16)
+        explanation = str(issue.get("объяснение") or issue.get("текст") or "Замечание")
+        recommendation = str(issue.get("минимальная_рекомендация") or issue.get("рекомендация") or "")
+        severity = str(issue.get("серьезность") or issue.get("severity") or "редакторское")
+        note = f"[{identifier}] {severity}: {explanation}" + (f" Рекомендация: {recommendation}" if recommendation else "")
+        additions.append((start, f"{{\\*\\atrfstart {reference}}}"))
+        additions.append((end, f"{{\\*\\atrfend {reference}}}{{\\*\\atnid {_escape_text(identifier)}}}{{\\*\\atnauthor Book Translator}}{{\\annotation {{\\*\\atnref{reference}}}{_escape_text(note)}}}"))
+    for position, value in sorted(additions, key=lambda item: item[0], reverse=True):
+        raw = raw[:position] + value + raw[position:]
+    target = destination or source
+    temporary = target.with_name(target.name + ".tmp.rtf")
+    temporary.write_text(raw, encoding="latin-1")
+    if inspect_rtf(temporary):
+        temporary.unlink(missing_ok=True); raise ValueError("RTF с аннотациями не прошел проверку.")
+    temporary.replace(target)
+    return target
+
+
+def strip_annotations(source: Path, destination: Path | None = None) -> Path:
+    raw = source.read_text(encoding="latin-1")
+    groups = _group_index(tokenize_rtf(raw))
+    ranges = [(group.start, group.end) for group in groups if group.destination in {"atrfstart", "atrfend", "atnid", "atnauthor", "annotation"}]
+    for start, end in sorted(ranges, reverse=True): raw = raw[:start] + raw[end:]
+    target = destination or source
+    temporary = target.with_name(target.name + ".tmp.rtf")
+    temporary.write_text(raw, encoding="latin-1")
+    if inspect_rtf(temporary):
+        temporary.unlink(missing_ok=True); raise ValueError("RTF после удаления аннотаций поврежден.")
+    temporary.replace(target)
+    return target
 
 
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""): digest.update(chunk)
     return digest.hexdigest()
 
 
-def _relative_path(project_dir: Path, path: Path) -> str:
-    project_dir = project_dir.resolve()
-    resolved = path.resolve()
-    try:
-        return resolved.relative_to(project_dir).as_posix()
-    except ValueError as error:
-        raise ValueError("Исходная глава должна находиться внутри проекта.") from error
+def rtf_fingerprints(path: Path) -> dict[str, str]:
+    data = extract_rtf(path)
+    text = "\n".join(block["текст"] for block in data["блоки"])
+    structure = json.dumps([(block["тип"], len(block["фрагменты"])) for block in data["блоки"]], ensure_ascii=False)
+    return {
+        "текст": hashlib.sha256(text.encode()).hexdigest(),
+        "структура": hashlib.sha256(structure.encode()).hexdigest(),
+        "файл": file_sha256(path),
+    }
 
 
-def _write_manifest(path: Path, manifest: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    temporary.replace(path)
+def annotations_only_change(before: dict[str, str], after: dict[str, str]) -> bool:
+    return before.get("текст") == after.get("текст") and before.get("структура") == after.get("структура")
 
 
-def build_manifest(project_dir: Path, chapters: list[Path]) -> dict:
-    project_dir = project_dir.resolve()
-    ordered = sorted((path.resolve() for path in chapters), key=natural_key)
-    entries = []
-    for number, chapter in enumerate(ordered, start=1):
-        relative = _relative_path(project_dir, chapter)
-        entries.append(
-            {
-                "номер": number,
-                "имя": chapter.name,
-                "путь": relative,
-                "sha256": file_sha256(chapter),
-            }
-        )
+def natural_key(path: Path) -> tuple:
+    return tuple(int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", path.name))
 
-    parents = {Path(entry["путь"]).parent.as_posix() for entry in entries}
-    source = next(iter(parents), ".") if len(parents) == 1 else "смешанный"
-    manifest = {"версия": 1, "источник": source, "главы": entries}
-    _write_manifest(project_dir / "work" / "manifest.json", manifest)
+
+def discover_chapters(project_dir: Path) -> list[Path]:
+    source = project_dir.resolve() / "input"
+    if not source.is_dir(): raise ValueError("Каталог input/ не найден; сначала выполните $book-translator-init.")
+    chapters = [path for path in source.iterdir() if path.is_file() and path.suffix.casefold() == ".rtf"]
+    unsupported = [path.name for path in source.iterdir() if path.is_file() and path.suffix.casefold() != ".rtf"]
+    if unsupported: raise ValueError("В input/ найдены неподдерживаемые файлы: " + ", ".join(sorted(unsupported)))
+    if not chapters: raise ValueError("В input/ не найдены главы .rtf.")
+    folded = [path.name.casefold() for path in chapters]
+    if len(folded) != len(set(folded)): raise ValueError("Имена входных RTF неоднозначны с учетом регистра.")
+    return sorted(chapters, key=natural_key)
+
+
+def chapter_id(path: Path) -> str:
+    return hashlib.sha256(path.name.casefold().encode("utf-8")).hexdigest()[:20]
+
+
+def build_manifest(project_dir: Path, chapters: list[Path] | None = None) -> dict:
+    project_dir = project_dir.resolve(); chapters = chapters or discover_chapters(project_dir)
+    manifest = {"версия": 2, "главы": [{"id": chapter_id(path), "имя": path.name, "путь": path.relative_to(project_dir).as_posix(), "sha256": file_sha256(path)} for path in chapters]}
+    target = project_dir / "work" / "manifest.json"; target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(".tmp"); temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"); temporary.replace(target)
     return manifest
 
 
-def _manifest_paths(manifest: dict) -> list[str]:
-    chapters = manifest.get("главы")
-    if not isinstance(chapters, list):
-        raise ValueError("Манифест не содержит корректный список глав.")
-    paths = []
-    for chapter in chapters:
-        if not isinstance(chapter, dict) or not isinstance(chapter.get("путь"), str):
-            raise ValueError("Манифест содержит главу без корректного пути.")
-        paths.append(Path(chapter["путь"]).as_posix())
-    return paths
+def refresh_manifest(project_dir: Path, manifest: dict, allow_changed: str | None = None) -> tuple[dict, list[dict], list[str]]:
+    current = discover_chapters(project_dir); old = {item["имя"].casefold(): item for item in manifest.get("главы", [])}
+    queue: list[dict] = []; conflicts: list[str] = []; entries: list[dict] = []
+    for path in current:
+        previous = old.get(path.name.casefold()); digest = file_sha256(path)
+        entry = {"id": chapter_id(path), "имя": path.name, "путь": path.relative_to(project_dir).as_posix(), "sha256": digest}
+        entries.append(entry)
+        if previous is None: queue.append(entry)
+        elif previous.get("sha256") != digest:
+            if allow_changed and path.name.casefold() == allow_changed.casefold(): queue.append(entry)
+            else: conflicts.append(f"Исходник «{path.name}» изменен; выберите перевести-заново или восстановите прежнюю версию.")
+    missing = [item["имя"] for key, item in old.items() if key not in {path.name.casefold() for path in current}]
+    conflicts.extend(f"Исходник «{name}» удален." for name in missing)
+    return {"версия": 2, "главы": entries}, queue, conflicts
 
 
 def verify_manifest(project_dir: Path, manifest: dict) -> list[str]:
-    project_dir = project_dir.resolve()
-    try:
-        manifest_paths = _manifest_paths(manifest)
-    except ValueError as error:
-        return [str(error)]
+    _, _, conflicts = refresh_manifest(project_dir, manifest)
+    return conflicts
 
-    try:
-        current = discover_chapters(project_dir)
-    except ValueError as error:
-        if "не найдены" in str(error):
-            current = []
-        else:
-            return [str(error)]
 
-    current_paths = {_relative_path(project_dir, path): path for path in current}
-    errors = []
-    for chapter in manifest["главы"]:
-        relative = Path(chapter["путь"]).as_posix()
-        path = current_paths.get(relative)
-        if path is None:
-            errors.append(f"Глава «{chapter.get('имя', relative)}» удалена.")
-            continue
-        expected = chapter.get("sha256")
-        if not isinstance(expected, str) or file_sha256(path) != expected:
-            errors.append(f"Глава «{path.name}» изменена.")
-
-    current_order = [_relative_path(project_dir, path) for path in current]
-    expected_order = manifest_paths
-    new_paths = [path for path in current_order if path not in expected_order]
-    if expected_order:
-        last_key = natural_key(Path(expected_order[-1]))
-        if any(natural_key(Path(path)) <= last_key for path in new_paths):
-            errors.append(
-                "Новые главы должны добавляться только после последней зафиксированной главы."
-            )
+def validate_translation(source_blocks: list[dict], target_blocks: list[dict]) -> list[str]:
+    errors: list[str] = []
+    if len(source_blocks) != len(target_blocks): errors.append("Количество блоков перевода не совпадает с оригиналом.")
+    for index, block in enumerate(target_blocks, start=1):
+        text = str(block.get("текст", ""))
+        fragments = block.get("фрагменты")
+        if isinstance(fragments, list): text = "".join(str(item.get("текст", "")) for item in fragments)
+        if "ё" in text or "Ё" in text: errors.append(f"Блок {index} содержит запрещенную букву ё.")
+        if index <= len(source_blocks):
+            source_fragments = source_blocks[index - 1].get("фрагменты")
+            target_fragments = block.get("фрагменты")
+            if isinstance(source_fragments, list) and isinstance(target_fragments, list):
+                source_formats = [(bool(item.get("полужирный")), bool(item.get("курсив"))) for item in source_fragments]
+                target_formats = [(bool(item.get("полужирный")), bool(item.get("курсив"))) for item in target_fragments]
+                if source_formats != target_formats: errors.append(f"Блок {index} изменяет форматирующие фрагменты.")
     return errors
 
 
-def _output_suffix(chapter: Path, output_format: str) -> str | None:
-    selected = normalize_output_format(output_format)
-    if selected == "original":
-        return chapter.suffix.casefold()
-    if selected == "docx":
-        return ".docx"
-    if selected == "pages":
-        return ".pages"
-    return None
-
-
-def _confirmed_outputs(
-    project_dir: Path, chapters: list[Path], output_format: str
-) -> tuple[set[str], str | None, str | None]:
-    progress_path = project_dir / "progress.json"
-    try:
-        progress = json.loads(progress_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return set(), None, None
-    if not isinstance(progress, dict):
-        return set(), None, None
-
-    last_ready = progress.get("последняя_готовая_глава")
-    if last_ready is None:
-        return set(), None, None
-    ordered = sorted(chapters, key=natural_key)
-    try:
-        last_index = next(
-            index for index, chapter in enumerate(ordered)
-            if chapter.name == last_ready
-        )
-    except StopIteration:
-        return set(), None, None
-    confirmed = set()
-    last_name = None
-    for chapter in ordered[: last_index + 1]:
-        suffix = _output_suffix(chapter, output_format)
-        if suffix is None:
-            return set(), None, None
-        name = f"{chapter.stem}{suffix}"
-        confirmed.add(name.casefold())
-        last_name = name
-    result_hash = progress.get("sha256_результата")
-    if result_hash is not None and not isinstance(result_hash, str):
-        return set(), None, None
-    return confirmed, last_name.casefold() if last_name else None, result_hash
-
-
-def check_output_conflicts(
-    project_dir: Path, chapters: list[Path], output_format: str
-) -> list[str]:
-    project_dir = project_dir.resolve()
-    output_dir = project_dir / "output"
-    names = {}
-    errors = []
-    confirmed, last_confirmed, result_hash = _confirmed_outputs(
-        project_dir, chapters, output_format
-    )
-    for chapter in sorted(chapters, key=natural_key):
-        suffix = _output_suffix(chapter, output_format)
-        if suffix is None:
-            errors.append(f"Неподдерживаемый выходной формат: {output_format}.")
-            break
-        name = f"{chapter.stem}{suffix}"
-        folded = name.casefold()
-        previous = names.get(folded)
-        if previous is not None:
-            errors.append(
-                f"Главы «{previous.name}» и «{chapter.name}» создают одно имя результата «{name}»."
-            )
-        else:
-            names[folded] = chapter
-
-        if output_dir.exists():
-            existing = next(
-                (path for path in output_dir.iterdir() if path.name.casefold() == folded),
-                None,
-            )
-            if existing is not None and existing.name.casefold() not in confirmed:
-                errors.append(
-                    f"Выходной файл «{existing.name}» уже существует и не подтверждён текущей контрольной точкой."
-                )
-            elif (
-                existing is not None
-                and existing.name.casefold() == last_confirmed
-                and result_hash is not None
-                and file_sha256(existing) != result_hash
-            ):
-                errors.append(
-                    f"Выходной файл «{existing.name}» не совпадает с контрольной суммой контрольной точки."
-                )
-    return errors
-
-
-def _block_type(paragraph) -> str:
-    text = paragraph.text.strip()
-    style = (paragraph.style.name or "") if paragraph.style else ""
-    normalized_style = style.casefold()
-    if normalized_style.startswith(("heading", "заголовок")):
-        return "заголовок"
-    if text in {"***", "* * *", "— — —"} or "scene" in normalized_style:
-        return "разрыв_сцены"
-    return "абзац"
-
-
-def _run_footnote_id(run) -> str | None:
-    element = getattr(run, "_r", run)
-    for reference in element.iter(f"{{{W}}}footnoteReference"):
-        return reference.get(f"{{{W}}}id")
-    return None
-
-
-def _run_fragments(run) -> list[dict]:
-    fragment = {
-        "текст": run.text,
-        "курсив": bool(run.italic),
-        "полужирный": bool(run.bold),
-        "сноска": _run_footnote_id(run),
-    }
-    if fragment["сноска"] is None or not fragment["текст"]:
-        return [fragment]
-    return [{**fragment, "сноска": None}, {**fragment, "текст": ""}]
-
-
-def _footnote_fragments(paragraph) -> tuple[str, list[dict]]:
-    style = "Normal"
-    style_element = paragraph.find(f"./{{{W}}}pPr/{{{W}}}pStyle")
-    if style_element is not None:
-        style = style_element.get(f"{{{W}}}val", style)
-    fragments = []
-    for run in paragraph.findall(f"./{{{W}}}r"):
-        properties = run.find(f"./{{{W}}}rPr")
-
-        def has_property(name: str) -> bool:
-            if properties is None:
-                return False
-            element = properties.find(f"./{{{W}}}{name}")
-            return element is not None and element.get(f"{{{W}}}val", "1") not in {"0", "false", "False"}
-
-        reference = run.find(f"./{{{W}}}footnoteReference")
-        fragment = {
-            "текст": "".join(text.text or "" for text in run.findall(f".//{{{W}}}t")),
-            "курсив": has_property("i"),
-            "полужирный": has_property("b"),
-            "сноска": None if reference is None else reference.get(f"{{{W}}}id"),
-        }
-        if fragment["сноска"] is not None and fragment["текст"]:
-            fragments.extend([{**fragment, "сноска": None}, {**fragment, "текст": ""}])
-        else:
-            fragments.append(fragment)
-    return style, fragments
-
-
-def _footnotes(source: Path) -> dict[str, list[tuple[str, list[dict]]]]:
-    with zipfile.ZipFile(source) as archive:
-        try:
-            root = ElementTree.fromstring(archive.read("word/footnotes.xml"))
-        except KeyError:
-            return {}
-    footnotes = {}
-    for footnote in root.findall(f"./{{{W}}}footnote"):
-        identifier = footnote.get(f"{{{W}}}id")
-        if identifier in {None, "-1", "0"}:
-            continue
-        footnotes[identifier] = [
-            _footnote_fragments(paragraph)
-            for paragraph in footnote.findall(f"./{{{W}}}p")
-        ]
-    return footnotes
-
-
-def inspect_docx(path: Path) -> list[str]:
-    try:
-        with zipfile.ZipFile(path) as archive:
-            entries = archive.infolist()
-            names = {entry.filename for entry in entries}
-            if len(entries) != len(names):
-                return ["Документ DOCX повреждён или защищён паролем."]
-            required_parts = {
-                "[Content_Types].xml",
-                "_rels/.rels",
-                "word/document.xml",
-                "word/_rels/document.xml.rels",
-            }
-            if not required_parts <= names:
-                return ["Документ DOCX повреждён или защищён паролем."]
-            xml_parts = [
-                (entry.filename, ElementTree.fromstring(archive.read(entry)))
-                for entry in entries
-                if entry.filename.endswith((".xml", ".rels"))
-            ]
-            warnings = [message for name, message in UNSUPPORTED_PARTS.items() if name in names]
-            found = set()
-            contains_table = False
-            for name, root in xml_parts:
-                if not name.startswith("word/"):
-                    continue
-                for element in root.iter():
-                    if element.tag == f"{{{W}}}tbl":
-                        contains_table = True
-                    local_name = element.tag.rsplit("}", 1)[-1]
-                    if local_name in UNSUPPORTED_XML:
-                        found.add(local_name)
-            if contains_table:
-                warnings.append("Документы с таблицами пока не поддерживаются.")
-            return warnings + [
-                message for name, message in UNSUPPORTED_XML.items() if name in found
-            ]
-    except (OSError, RuntimeError, zipfile.BadZipFile, ElementTree.ParseError):
-        return ["Документ DOCX повреждён или защищён паролем."]
-
-
-def extract_docx(source: Path, destination: Path) -> list[dict]:
-    from docx import Document
-
-    errors = inspect_docx(source)
-    if errors:
-        raise ValueError(" ".join(errors))
-    document = Document(source)
-    if document.tables:
-        raise ValueError("Документы с таблицами пока не поддерживаются.")
-    footnotes = _footnotes(source)
-    inserted_footnotes = set()
-    blocks = []
-    for number, paragraph in enumerate(document.paragraphs, start=1):
-        fragments = [fragment for run in paragraph.runs for fragment in _run_fragments(run)]
-        blocks.append(
-            {
-                "идентификатор": f"B{number:06d}",
-                "тип": _block_type(paragraph),
-                "стиль": (paragraph.style.name or "") if paragraph.style else "",
-                "фрагменты": fragments,
-            }
-        )
-        for fragment in fragments:
-            footnote_id = fragment["сноска"]
-            if footnote_id not in footnotes or footnote_id in inserted_footnotes:
-                continue
-            inserted_footnotes.add(footnote_id)
-            for index, (style, footnote_fragments) in enumerate(footnotes[footnote_id], start=1):
-                blocks.append(
-                    {
-                        "идентификатор": f"F{footnote_id}-P{index}",
-                        "тип": "сноска",
-                        "стиль": style,
-                        "фрагменты": footnote_fragments,
-                    }
-                )
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(
-        json.dumps(blocks, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    return blocks
-
-
-def load_blocks(path: Path) -> list[dict]:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _replace_run_text(run, text: str) -> None:
-    text_elements = list(run.iter(f"{{{W}}}t"))
-    if not text_elements:
-        if text:
-            raise ValueError("Структура оформления документа изменилась.")
-        return
-    text_elements[0].text = text
-    for element in text_elements[1:]:
-        element.text = ""
-
-
-def _rewrite_docx_package(path: Path, replacements: dict[str, bytes]) -> None:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx", dir=path.parent) as temporary:
-        temporary_path = Path(temporary.name)
-    try:
-        with zipfile.ZipFile(path, "r") as source, zipfile.ZipFile(
-            temporary_path, "w", zipfile.ZIP_DEFLATED
-        ) as target:
-            for item in source.infolist():
-                target.writestr(item, replacements.get(item.filename, source.read(item.filename)))
-            for name, content in replacements.items():
-                if name not in source.namelist():
-                    target.writestr(name, content)
-        temporary_path.replace(path)
-    finally:
-        temporary_path.unlink(missing_ok=True)
-
-
-def _replace_footnote_text_in_package(path: Path, blocks: list[dict]) -> None:
-    footnote_blocks = [block for block in blocks if block.get("тип") == "сноска"]
-    if not footnote_blocks:
-        return
-    try:
-        with zipfile.ZipFile(path) as archive:
-            root = ElementTree.fromstring(archive.read("word/footnotes.xml"))
-    except (KeyError, zipfile.BadZipFile, ElementTree.ParseError) as error:
-        raise ValueError("Не удалось сохранить текст сносок документа.") from error
-
-    for block in footnote_blocks:
-        match = re.fullmatch(r"F(.+)-P(\d+)", str(block.get("идентификатор", "")))
-        if match is None:
-            raise ValueError("Структура сносок проверенного перевода некорректна.")
-        footnote_id, paragraph_number = match.groups()
-        footnote = root.find(f"./{{{W}}}footnote[@{{{W}}}id='{footnote_id}']")
-        paragraphs = [] if footnote is None else footnote.findall(f"./{{{W}}}p")
-        paragraph_index = int(paragraph_number) - 1
-        if paragraph_index >= len(paragraphs):
-            raise ValueError(f"Структура оформления блока {block['идентификатор']} изменилась.")
-        fragments = _fragments(block)
-        fragment_index = 0
-        for run in paragraphs[paragraph_index].findall(f"./{{{W}}}r"):
-            text = "".join(item.text or "" for item in run.iter(f"{{{W}}}t"))
-            reference = _run_footnote_id(run)
-            if text or reference is None:
-                if fragment_index >= len(fragments):
-                    raise ValueError(f"Структура оформления блока {block['идентификатор']} изменилась.")
-                _replace_run_text(run, fragments[fragment_index]["текст"])
-                fragment_index += 1
-            if reference is not None:
-                fragment_index += 1
-        if fragment_index != len(fragments):
-            raise ValueError(f"Структура оформления блока {block['идентификатор']} изменилась.")
-    _rewrite_docx_package(
-        path,
-        {"word/footnotes.xml": ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)},
-    )
-
-
-def rebuild_docx(template: Path, translated_blocks: list[dict], destination: Path) -> None:
-    from docx import Document
-
-    if not isinstance(translated_blocks, list):
-        raise ValueError("Проверенный перевод должен содержать список блоков.")
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        expected_blocks = extract_docx(template, Path(temporary_directory) / "blocks.json")
-    errors = validate_translation(expected_blocks, translated_blocks)
-    if errors:
-        raise ValueError(" ".join(errors))
-    document = Document(template)
-    main_blocks = [block for block in translated_blocks if block.get("тип") != "сноска"]
-    if len(document.paragraphs) != len(main_blocks):
-        raise ValueError("Количество блоков шаблона не совпадает с проверенным переводом.")
-    for paragraph, block in zip(document.paragraphs, main_blocks, strict=True):
-        if block.get("тип") == "разрыв_сцены":
-            continue
-        fragments = _fragments(block)
-        fragment_index = 0
-        for run in paragraph.runs:
-            reference = _run_footnote_id(run)
-            if run.text or reference is None:
-                if fragment_index >= len(fragments):
-                    raise ValueError(f"Структура оформления блока {block['идентификатор']} изменилась.")
-                if reference is None:
-                    run.text = fragments[fragment_index]["текст"]
-                else:
-                    _replace_run_text(run._r, fragments[fragment_index]["текст"])
-                fragment_index += 1
-            if reference is not None:
-                fragment_index += 1
-        if fragment_index != len(fragments):
-            raise ValueError(f"Структура оформления блока {block['идентификатор']} изменилась.")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    document.save(destination)
-    try:
-        _replace_footnote_text_in_package(destination, translated_blocks)
-        errors = inspect_docx(destination)
-    except ValueError:
-        destination.unlink(missing_ok=True)
-        raise
-    if errors:
-        destination.unlink(missing_ok=True)
-        raise ValueError(" ".join(errors))
-
-
-def docx_has_footnote_reference(path: Path, footnote_id: str) -> bool:
-    with zipfile.ZipFile(path) as archive:
-        root = ElementTree.fromstring(archive.read("word/document.xml"))
-    return any(
-        reference.get(f"{{{W}}}id") == footnote_id
-        for reference in root.iter(f"{{{W}}}footnoteReference")
-    )
-
-
-def docx_footnote_text(path: Path, footnote_id: str) -> str:
-    with zipfile.ZipFile(path) as archive:
-        root = ElementTree.fromstring(archive.read("word/footnotes.xml"))
-    footnote = root.find(f"./{{{W}}}footnote[@{{{W}}}id='{footnote_id}']")
-    if footnote is None:
-        return ""
-    return "".join(text.text or "" for text in footnote.iter(f"{{{W}}}t"))
-
-
-def _fragments(block: dict) -> list[dict]:
-    fragments = block.get("фрагменты", []) if isinstance(block, dict) else []
-    return fragments if isinstance(fragments, list) else []
-
-
-def _format_signature(block: dict) -> tuple:
-    fragments = _fragments(block)
-    return len(fragments), tuple(
-        (
-            fragment.get("курсив"),
-            fragment.get("полужирный"),
-            fragment.get("сноска"),
-        )
-        for fragment in fragments
-        if isinstance(fragment, dict)
-    )
-
-
-def validate_translation(source_blocks: list[dict], translated_blocks: list[dict]) -> list[str]:
-    errors = []
-    expected = [block["идентификатор"] for block in source_blocks]
-    actual = [block.get("идентификатор") if isinstance(block, dict) else None for block in translated_blocks]
-    for identifier in expected:
-        count = actual.count(identifier)
-        if count == 0:
-            errors.append(f"Блок {identifier} отсутствует.")
-        elif count > 1:
-            errors.append(f"Блок {identifier} повторён.")
-    for identifier in actual:
-        if identifier not in expected:
-            errors.append(f"Обнаружен неизвестный блок {identifier}.")
-    if actual != expected and len(actual) == len(expected) and all(identifier in expected for identifier in actual):
-        errors.append("Порядок блоков изменён.")
-    source_by_id = {block["идентификатор"]: block for block in source_blocks}
-    for block in translated_blocks:
-        if not isinstance(block, dict) or block.get("идентификатор") not in source_by_id:
-            continue
-        identifier = block["идентификатор"]
-        if block.get("тип") != source_by_id[identifier].get("тип"):
-            errors.append(f"Тип блока {identifier} изменён.")
-        translated_fragments = block.get("фрагменты")
-        if not isinstance(translated_fragments, list) or any(
-            not isinstance(fragment, dict) or not isinstance(fragment.get("текст"), str)
-            for fragment in translated_fragments
-        ):
-            errors.append(f"Фрагменты блока {identifier} содержат некорректный текст.")
-            continue
-        source_text = "".join(
-            fragment.get("текст", "") for fragment in _fragments(source_by_id[identifier]) if isinstance(fragment, dict)
-        )
-        translated_text = "".join(
-            fragment.get("текст", "") for fragment in _fragments(block) if isinstance(fragment, dict)
-        )
-        if source_text.strip() and not translated_text.strip():
-            errors.append(f"Перевод блока {identifier} пуст.")
-        if _format_signature(source_by_id[identifier]) != _format_signature(block):
-            errors.append(f"Маркеры оформления блока {identifier} изменены.")
-    return errors
-
-
-def _block_length(block: dict) -> int:
-    return sum(
-        len(fragment.get("текст", ""))
-        for fragment in _fragments(block)
-        if isinstance(fragment, dict)
-    )
-
-
-def _referenced_footnotes(block: dict) -> set[str]:
-    return {
-        fragment["сноска"]
-        for fragment in _fragments(block)
-        if isinstance(fragment, dict) and isinstance(fragment.get("сноска"), str)
-    }
-
-
-def split_blocks(blocks: list[dict], max_chars: int) -> list[list[dict]]:
-    if max_chars <= 0:
-        raise ValueError("Максимальная длина части должна быть больше нуля.")
-    groups = []
-    index = 0
-    while index < len(blocks):
-        group = [blocks[index]]
-        references = _referenced_footnotes(blocks[index])
-        index += 1
-        while index < len(blocks):
-            candidate = blocks[index]
-            identifier = candidate.get("идентификатор", "")
-            if candidate.get("тип") != "сноска" or not any(identifier.startswith(f"F{reference}-P") for reference in references):
-                break
-            group.append(candidate)
-            index += 1
-        groups.append(group)
-
-    chunks = []
-    chunk = []
-    size = 0
-    for group in groups:
-        group_size = sum(_block_length(block) for block in group)
-        if chunk and size + group_size > max_chars:
-            chunks.append(chunk)
-            chunk = []
-            size = 0
-        chunk.extend(group)
-        size += group_size
-    if chunk:
-        chunks.append(chunk)
-    return chunks
+def check_output_conflicts(project_dir: Path, chapters: list[Path]) -> list[str]:
+    names = [f"{path.stem}.rtf".casefold() for path in chapters]
+    return ["Несколько исходников создают одинаковое имя результата."] if len(names) != len(set(names)) else []
