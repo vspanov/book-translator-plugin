@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -24,6 +25,50 @@ class ContractTests(unittest.TestCase):
         combined = "\n".join(path.read_text(encoding="utf-8") for path in agents.glob("*.toml"))
         for phrase in ("не цензур", "пользователь", "state"):
             self.assertIn(phrase, combined.casefold())
+
+    def test_agent_instructions_are_self_contained_and_role_specific(self):
+        agents = ROOT / "skills" / "book-translator" / "assets" / "agents"
+        instructions = {
+            path.stem: tomllib.loads(path.read_text(encoding="utf-8"))["developer_instructions"].casefold()
+            for path in agents.glob("*.toml")
+        }
+        for phrase in (
+            "до непосредственного перевода",
+            "точку зрения каждой части",
+            "голос рассказчика",
+            "намеренные повторы",
+            "контекстные значения терминов",
+            "не добавляй",
+            "прямую речь",
+            "буквы ё и ё",
+        ):
+            self.assertIn(phrase, instructions["translator"])
+        for phrase in (
+            "механически проверь каждый блок",
+            "критическая_ошибка",
+            "нужна_редактура",
+            "точная_цитата",
+            "номер_вхождения",
+            "решение о публикации принимает не verifier",
+        ):
+            self.assertIn(phrase, instructions["verifier"])
+        for phrase in (
+            "все и только конкретные замечания",
+            "не используй старые отчеты",
+            "сохрани все id",
+            "не удаляй пользовательские или агентские аннотации",
+            "единственный результат",
+        ):
+            self.assertIn(phrase, instructions["editor"])
+        for phrase in (
+            "замени, а не допиши повторно",
+            "пользовательскую область",
+            "управляемые подразделы всех остальных файлов",
+            "chapter-summaries.md",
+            "не пересчитывай сведения последующих глав",
+            "единственный результат",
+        ):
+            self.assertIn(phrase, instructions["state-updater"])
 
     def test_no_external_runtime_dependencies(self):
         self.assertFalse((ROOT / "requirements.txt").exists())
@@ -59,6 +104,104 @@ class ContractTests(unittest.TestCase):
             self.assertIn(phrase, principles)
         self.assertIn("Add to chat", skill)
         self.assertIn("кликабельную абсолютную ссылку", skill)
+
+    def test_detailed_coordinator_workflow_is_preserved(self):
+        skill = (ROOT / "skills" / "book-translator" / "SKILL.md").read_text(encoding="utf-8").casefold()
+        for heading in (
+            "## предварительная проверка",
+            "## неподвижные правила координации",
+            "## порядок обработки одного файла",
+            "## длинный файл",
+            "## шаблоны стартовых заданий",
+            "## самопроверка координатора",
+            "## запрещенные сокращения процесса",
+        ):
+            self.assertIn(heading, skill)
+        for agent_name in (
+            "book_translator_translator",
+            "book_translator_verifier",
+            "book_translator_editor",
+            "book_translator_state_updater",
+        ):
+            self.assertIn(agent_name, skill)
+        self.assertIn("не более одного ролевого агента", skill)
+        self.assertIn("пять verifier и четыре промежуточных editor", skill)
+
+    def test_reference_rules_keep_detailed_statuses_and_literary_sections(self):
+        references = ROOT / "skills" / "book-translator" / "references"
+        principles = (references / "translation-principles.md").read_text(encoding="utf-8").casefold()
+        verification = (references / "verification-rules.md").read_text(encoding="utf-8").casefold()
+        for heading in (
+            "## контекст до перевода",
+            "## запрет на англоязычную кальку",
+            "## голоса рассказчика и персонажей",
+            "## намеренные повторы, паузы, обрывы и ритм",
+            "## контекстные значения и термины мира",
+            "## неоднозначность, тяжелые темы и отсутствие цензуры",
+            "## русская прямая речь и типографика",
+            "## метафоры без смыслового обеднения",
+            "## финальная редактура",
+        ):
+            self.assertIn(heading, principles)
+        for heading in (
+            "## механическая проверка, блокирующая публикацию",
+            "## критическая смысловая ошибка",
+            "## требует редактуры",
+            "## пройдено",
+            "## контракт замечания",
+            "## поведение после последнего раунда",
+        ):
+            self.assertIn(heading, verification)
+
+    def test_readme_documents_coordinator_model_and_russian_docs_policy(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        guide = (ROOT / "AGENTS.md").read_text(encoding="utf-8").casefold()
+        self.assertIn('model = "gpt-5.6-terra"', readme)
+        self.assertIn('model_reasoning_effort = "medium"', readme)
+        self.assertIn("Навык не может переключить модель", readme)
+        self.assertIn("## язык документации", guide)
+        self.assertIn("все readme", guide)
+
+    def test_readme_is_a_complete_user_guide_without_internal_contract_noise(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8").casefold()
+        for heading in (
+            "## установка плагина",
+            "## быстрый старт",
+            "## структура рабочего каталога",
+            "## команды и настройки",
+            "## как устроен перевод",
+            "## проверка пользователем",
+            "## новые главы и повторный перевод",
+            "## что хранится в state",
+            "## надежность и ограничения",
+            "## частые проблемы",
+        ):
+            self.assertIn(heading, readme)
+        for phrase in (
+            "codex plugin marketplace add vspanov/book-translator-plugin --ref main",
+            "$book-translator-init",
+            "$book-translator",
+            "максимум_циклов = 5",
+            "пользовательская_верификация = в_финале",
+            "add to chat",
+            "пользовательский глоссарий имеет абсолютный приоритет",
+        ):
+            self.assertIn(phrase, readme)
+        for internal_detail in ("точная_цитата", "номер_вхождения", "prepare_transaction("):
+            self.assertNotIn(internal_detail, readme)
+
+    def test_state_templates_prompt_for_narrative_style_and_plot(self):
+        assets = ROOT / "skills" / "book-translator" / "assets"
+        style = (assets / "style-guide.md").read_text(encoding="utf-8").casefold()
+        story = (assets / "story-state.md").read_text(encoding="utf-8")
+        for heading in (
+            "## голос рассказчика",
+            "## ритм",
+            "## намеренные повторы",
+            "## паузы и обрывы",
+        ):
+            self.assertIn(heading, style)
+        self.assertTrue(story.startswith("# Состояние сюжета"))
 
 
 if __name__ == "__main__":
