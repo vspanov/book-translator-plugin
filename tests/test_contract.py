@@ -203,6 +203,23 @@ class ContractTests(unittest.TestCase):
         self.assertIn("## язык документации", guide)
         self.assertIn("все readme", guide)
 
+    def test_readme_explains_global_python_installation(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for phrase in (
+            "### Глобальная установка Python 3.10 или новее",
+            "#### Windows",
+            "py install 3.10",
+            "#### macOS",
+            "python3 --version",
+            "#### Linux",
+            "sudo apt install python3",
+            "sudo dnf install python3",
+            "sudo pacman -S python",
+            "make altinstall",
+            "не заменяйте вручную системный `/usr/bin/python3`",
+        ):
+            self.assertIn(phrase, readme)
+
     def test_readme_is_a_complete_user_guide_without_internal_contract_noise(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8").casefold()
         for heading in (
