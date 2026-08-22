@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Виртуальные окружения и локальные переменные
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Локальные настройки редакторов
+.idea/
+.vscode/
+*.code-workspace
+
+# Временные файлы и ОС
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini

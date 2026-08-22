@@ -1,0 +1,9 @@
+* text=auto eol=crlf
+
+# Форматы, содержимое которых Git не должен преобразовывать
+*.rtf -text
+*.png -text
+*.jpg -text
+*.jpeg -text
+*.gif -text
+*.zip -text
