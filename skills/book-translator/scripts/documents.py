@@ -3,7 +3,9 @@ from __future__ import annotations
 import codecs
 import hashlib
 import json
+import os
 import re
+import stat
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
@@ -24,6 +26,8 @@ SKIPPED_DESTINATIONS = {
     "atrfstart", "atrfend", "atnid", "atnauthor", "annotation", "atnref",
 }
 DESTINATION_WORDS = SKIPPED_DESTINATIONS | UNSAFE_DESTINATIONS | {"footnote"}
+REPARSE_POINT_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+ANNOTATION_DESTINATIONS = {"atrfstart", "atrfend", "atnid", "atnauthor", "annotation"}
 
 
 @dataclass(frozen=True)
@@ -543,9 +547,7 @@ def add_annotations(source: Path, issues: Iterable[dict], destination: Path | No
 
 def strip_annotations(source: Path, destination: Path | None = None) -> Path:
     raw = source.read_text(encoding="latin-1")
-    groups = _group_index(tokenize_rtf(raw))
-    ranges = [(group.start, group.end) for group in groups if group.destination in {"atrfstart", "atrfend", "atnid", "atnauthor", "annotation"}]
-    for start, end in sorted(ranges, reverse=True): raw = raw[:start] + raw[end:]
+    raw = _rtf_without_annotations(raw)
     target = destination or source
     temporary = target.with_name(target.name + ".tmp.rtf")
     temporary.write_text(raw, encoding="latin-1")
@@ -562,8 +564,17 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _rtf_without_annotations(raw: str) -> str:
+    groups = _group_index(tokenize_rtf(raw))
+    ranges = [(group.start, group.end) for group in groups if group.destination in ANNOTATION_DESTINATIONS]
+    for start, end in sorted(ranges, reverse=True):
+        raw = raw[:start] + raw[end:]
+    return raw
+
+
 def rtf_fingerprints(path: Path) -> dict[str, str]:
     data = extract_rtf(path)
+    raw_without_annotations = _rtf_without_annotations(path.read_text(encoding="latin-1"))
     text = "\n".join(block["текст"] for block in data["блоки"])
     structure = json.dumps([
         (
@@ -576,23 +587,57 @@ def rtf_fingerprints(path: Path) -> dict[str, str]:
     return {
         "текст": hashlib.sha256(text.encode()).hexdigest(),
         "структура": hashlib.sha256(structure.encode()).hexdigest(),
+        "rtf_без_аннотаций": hashlib.sha256(raw_without_annotations.encode("latin-1")).hexdigest(),
         "файл": file_sha256(path),
     }
 
 
 def annotations_only_change(before: dict[str, str], after: dict[str, str]) -> bool:
-    return before.get("текст") == after.get("текст") and before.get("структура") == after.get("структура")
+    return (
+        before.get("текст") == after.get("текст")
+        and before.get("структура") == after.get("структура")
+        and before.get("rtf_без_аннотаций") == after.get("rtf_без_аннотаций")
+    )
 
 
 def natural_key(path: Path) -> tuple:
     return tuple(int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", path.name))
 
 
+def _is_unsafe_link(path: Path) -> bool:
+    try:
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except OSError:
+        attributes = 0
+    return path.is_symlink() or bool(attributes & REPARSE_POINT_ATTRIBUTE)
+
+
 def discover_chapters(project_dir: Path) -> list[Path]:
     source = project_dir.resolve() / "input"
+    if _is_unsafe_link(source):
+        raise ValueError("Каталог input/ не должен быть символической ссылкой или reparse point.")
     if not source.is_dir(): raise ValueError("Каталог input/ не найден; сначала выполните $book-translator-init.")
-    chapters = [path for path in source.iterdir() if path.is_file() and path.suffix.casefold() == ".rtf"]
-    unsupported = [path.name for path in source.iterdir() if path.is_file() and path.suffix.casefold() != ".rtf"]
+    chapters: list[Path] = []
+    unsupported: list[str] = []
+    try:
+        entries = list(os.scandir(source))
+    except OSError as error:
+        raise ValueError("Не удалось безопасно прочитать каталог input/.") from error
+    for entry in entries:
+        path = Path(entry.path)
+        if _is_unsafe_link(path):
+            raise ValueError(f"Путь input/{path.name} не должен быть символической ссылкой или reparse point.")
+        if not entry.is_file(follow_symlinks=False):
+            continue
+        try:
+            if path.resolve().parent != source.resolve():
+                raise ValueError(f"Файл input/{path.name} находится за пределами рабочего каталога.")
+        except OSError as error:
+            raise ValueError(f"Не удалось безопасно разрешить input/{path.name}.") from error
+        if path.suffix.casefold() == ".rtf":
+            chapters.append(path)
+        else:
+            unsupported.append(path.name)
     if unsupported: raise ValueError("В input/ найдены неподдерживаемые файлы: " + ", ".join(sorted(unsupported)))
     if not chapters: raise ValueError("В input/ не найдены главы .rtf.")
     folded = [path.name.casefold() for path in chapters]
@@ -604,16 +649,31 @@ def chapter_id(path: Path) -> str:
     return hashlib.sha256(path.name.casefold().encode("utf-8")).hexdigest()[:20]
 
 
+def _validate_source_chapters(chapters: list[Path]) -> None:
+    failures = [(path.name, inspect_rtf(path)) for path in chapters]
+    failures = [(name, errors) for name, errors in failures if errors]
+    if failures:
+        details = " ".join(f"«{name}»: {' '.join(errors)}" for name, errors in failures)
+        raise ValueError("Входные RTF не прошли проверку: " + details)
+
+
 def build_manifest(project_dir: Path, chapters: list[Path] | None = None) -> dict:
     project_dir = project_dir.resolve(); chapters = chapters or discover_chapters(project_dir)
+    _validate_source_chapters(chapters)
     manifest = {"версия": 2, "главы": [{"id": chapter_id(path), "имя": path.name, "путь": path.relative_to(project_dir).as_posix(), "sha256": file_sha256(path)} for path in chapters]}
     target = project_dir / "work" / "manifest.json"; target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(".tmp"); temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"); temporary.replace(target)
     return manifest
 
 
-def refresh_manifest(project_dir: Path, manifest: dict, allow_changed: str | None = None) -> tuple[dict, list[dict], list[str]]:
+def refresh_manifest(
+    project_dir: Path,
+    manifest: dict,
+    allow_changed: str | None = None,
+    protected_ids: set[str] | None = None,
+) -> tuple[dict, list[dict], list[str]]:
     current = discover_chapters(project_dir); old = {item["имя"].casefold(): item for item in manifest.get("главы", [])}
+    _validate_source_chapters(current)
     queue: list[dict] = []; conflicts: list[str] = []; entries: list[dict] = []
     for path in current:
         previous = old.get(path.name.casefold()); digest = file_sha256(path)
@@ -621,15 +681,22 @@ def refresh_manifest(project_dir: Path, manifest: dict, allow_changed: str | Non
         entries.append(entry)
         if previous is None: queue.append(entry)
         elif previous.get("sha256") != digest:
-            if allow_changed and path.name.casefold() == allow_changed.casefold(): queue.append(entry)
+            protected = entry["id"] in (protected_ids or set())
+            if not protected or (allow_changed and path.name.casefold() == allow_changed.casefold()): queue.append(entry)
             else: conflicts.append(f"Исходник «{path.name}» изменен; выберите перевести-заново или восстановите прежнюю версию.")
-    missing = [item["имя"] for key, item in old.items() if key not in {path.name.casefold() for path in current}]
+    current_names = {path.name.casefold() for path in current}
+    missing = [
+        item["имя"]
+        for key, item in old.items()
+        if key not in current_names and item.get("id") in (protected_ids or set())
+    ]
     conflicts.extend(f"Исходник «{name}» удален." for name in missing)
     return {"версия": 2, "главы": entries}, queue, conflicts
 
 
 def verify_manifest(project_dir: Path, manifest: dict) -> list[str]:
-    _, _, conflicts = refresh_manifest(project_dir, manifest)
+    protected_ids = {item.get("id") for item in manifest.get("главы", []) if isinstance(item.get("id"), str)}
+    _, _, conflicts = refresh_manifest(project_dir, manifest, protected_ids=protected_ids)
     return conflicts
 
 

@@ -156,6 +156,44 @@ class ContractTests(unittest.TestCase):
         ):
             self.assertIn(heading, verification)
 
+    def test_reference_rules_cover_expanded_literary_contract(self):
+        references = ROOT / "skills" / "book-translator" / "references"
+        principles = (references / "translation-principles.md").read_text(encoding="utf-8").casefold()
+        verification = (references / "verification-rules.md").read_text(encoding="utf-8").casefold()
+
+        for phrase in (
+            "художественную и смысловую плотность",
+            "громоздкими причастными оборотами",
+            "ритмом всего абзаца",
+            "рубленую схему",
+            "близкие повторы уникальных или заметных слов",
+            "цепочками `я — я` или `он — он`",
+            "абзацную структуру оригинала один к одному",
+            "я дал ему взгляд",
+            "намерения персонажей",
+            "сложную мысль ради гладкости",
+            "реплики должны быть живыми",
+            "объяснение сюжета читателю",
+            "сдержанной резкости",
+            "ругательства передавай функционально",
+            "не переводи каждое `fuck` одним и тем же словом",
+            "повествование может переходить между разными персонажами",
+            "`ë` и `ë`",
+        ):
+            self.assertIn(phrase, principles)
+
+        for phrase in (
+            "эмоциональный переход",
+            "сложная мысль упрощена",
+            "художественная плотность утрачена",
+            "объясняет читателю сюжет",
+            "ругательство переведено словарно",
+            "смене носителя точки зрения",
+            "абзац раздроблен без необходимости",
+            "`ë` или `ë`",
+        ):
+            self.assertIn(phrase, verification)
+
     def test_readme_documents_coordinator_model_and_russian_docs_policy(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         guide = (ROOT / "AGENTS.md").read_text(encoding="utf-8").casefold()

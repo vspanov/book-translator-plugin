@@ -5,13 +5,15 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "skills" / "book-translator" / "scripts"))
+import documents as module
 from documents import (
     add_annotations, annotations_only_change, extract_annotations, extract_rtf,
-    inspect_rtf, rebuild_rtf, rtf_fingerprints, strip_annotations,
+    discover_chapters, inspect_rtf, rebuild_rtf, rtf_fingerprints, strip_annotations,
     validate_publishable_rtf, validate_translation,
 )
 
@@ -123,6 +125,39 @@ class RtfTests(unittest.TestCase):
         self.assertEqual(before["текст"], after["текст"])
         self.assertNotEqual(before["структура"], after["структура"])
         self.assertFalse(annotations_only_change(before, after))
+
+    def test_canonical_fingerprint_detects_opaque_and_paragraph_changes(self):
+        mutations = {
+            "изображение": lambda raw: raw.replace("89504e470d0a", "99504e470d0a"),
+            "выравнивание": lambda raw: raw.replace(r"\pard Plain", r"\pard\qc Plain"),
+            "шрифт": lambda raw: raw.replace("Times New Roman", "Courier New"),
+            "цвет": lambda raw: raw.replace(r"{\stylesheet", r"{\colortbl;\red255\green0\blue0;}{\stylesheet"),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                path = self.directory / f"{name}.rtf"
+                path.write_text(fixture(), encoding="latin-1")
+                before = rtf_fingerprints(path)
+                path.write_text(mutate(path.read_text(encoding="latin-1")), encoding="latin-1")
+                after = rtf_fingerprints(path)
+                self.assertEqual(before["текст"], after["текст"])
+                self.assertFalse(annotations_only_change(before, after))
+
+    def test_discovery_rejects_mocked_reparse_point_in_input(self):
+        project = self.directory / "project"
+        source = project / "input"
+        source.mkdir(parents=True)
+        candidate = source / "linked.rtf"
+        candidate.write_text(r"{\rtf1\ansi Outside.\par}", encoding="latin-1")
+        real_check = module._is_unsafe_link
+
+        with mock.patch.object(module, "_is_unsafe_link", side_effect=lambda path: path == candidate or real_check(path)):
+            with self.assertRaisesRegex(ValueError, "reparse point"):
+                discover_chapters(project)
+
+    def test_input_link_helper_detects_symbolic_link(self):
+        with mock.patch.object(Path, "is_symlink", return_value=True):
+            self.assertTrue(module._is_unsafe_link(Path("linked.rtf")))
 
     def test_rejects_unsafe_text_destination_and_broken_rtf(self):
         unsafe = self.directory / "unsafe.rtf"

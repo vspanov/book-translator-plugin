@@ -14,7 +14,10 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "skills" / "book-translator" / "scripts"))
 import progress as module
-from documents import add_annotations, build_manifest, chapter_id, chat_feedback_to_issue, extract_annotations, file_sha256, refresh_manifest
+from documents import (
+    add_annotations, build_manifest, chapter_id, chat_feedback_to_issue, extract_annotations,
+    file_sha256, refresh_manifest, rtf_fingerprints,
+)
 from progress import (
     STATE_FILES, activate, approve_files, commit_transaction, complete_feedback_revision, initialize_project, load_config,
     execute_verification_cycles, load_progress, output_name, parse_request_arguments, prepare_state,
@@ -108,11 +111,37 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual([earlier.name], [item["имя"] for item in queue])
         self.assertEqual([], conflicts)
         later.write_text(r"{\rtf1 changed\par}", encoding="latin-1")
-        _, _, conflicts = refresh_manifest(self.project, refreshed)
+        _, queue, conflicts = refresh_manifest(self.project, refreshed)
+        self.assertEqual([], conflicts)
+        self.assertIn(later.name, [item["имя"] for item in queue])
+        _, _, conflicts = refresh_manifest(self.project, refreshed, protected_ids={chapter_id(later)})
         self.assertTrue(conflicts)
-        _, queue, conflicts = refresh_manifest(self.project, refreshed, allow_changed=later.name)
+        _, queue, conflicts = refresh_manifest(
+            self.project, refreshed, allow_changed=later.name, protected_ids={chapter_id(later)},
+        )
         self.assertIn(later.name, [item["имя"] for item in queue])
         self.assertEqual([], conflicts)
+
+    def test_invalid_new_source_is_not_baselined_and_unstarted_change_is_requeued(self):
+        source = self.project / "input" / "chapter-04.rtf"
+        source.write_text(r"{\rtf1 broken", encoding="latin-1")
+        manifest_path = self.project / "work" / "manifest.json"
+        with self.assertRaisesRegex(ValueError, "не прошли проверку"):
+            scan_queue(self.project)
+        self.assertFalse(manifest_path.exists())
+
+        source.write_text(r"{\rtf1\ansi First draft.\par}", encoding="latin-1")
+        _, queue, conflicts = scan_queue(self.project)
+        self.assertEqual([], conflicts)
+        self.assertEqual([source.name], [item["имя"] for item in queue])
+        first_digest = json.loads(manifest_path.read_text(encoding="utf-8"))["главы"][0]["sha256"]
+
+        source.write_text(r"{\rtf1\ansi Second draft.\par}", encoding="latin-1")
+        _, queue, conflicts = scan_queue(self.project)
+        self.assertEqual([], conflicts)
+        self.assertEqual([source.name], [item["имя"] for item in queue])
+        second_digest = json.loads(manifest_path.read_text(encoding="utf-8"))["главы"][0]["sha256"]
+        self.assertNotEqual(first_digest, second_digest)
 
     def test_completed_project_reopens_when_new_file_appears(self):
         first = self.source("chapter-03.rtf")
@@ -163,6 +192,15 @@ class ProgressTests(unittest.TestCase):
         )
         return identifier, commit_transaction(self.project, transaction), transaction
 
+    def _add_published_annotation(self, identifier, result, note_id="known-note"):
+        add_annotations(result, [{"id": note_id, "точная_цитата": "First", "объяснение": "Проверить."}])
+        progress = load_progress(self.project)
+        item = progress["файлы"][identifier]
+        item["sha256_результата"] = file_sha256(result)
+        item["отпечатки_при_публикации"] = rtf_fingerprints(result)
+        item["аннотации_при_публикации"] = [note_id]
+        module.save_progress(self.project, progress)
+
     def test_publish_with_reports_and_versioned_retranslation(self):
         identifier, first, first_transaction = self._publish()
         self.assertEqual("chapter-01.ru.rtf", first.name)
@@ -192,6 +230,17 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(state_before, (self.project / "state" / "glossary.md").read_bytes())
         self.assertTrue(first.is_file())
         self.assertFalse((self.project / "output" / output_name(source.name, 2)).exists())
+
+        retry_state = self.project / "work" / "prepared-retry"
+        shutil.copytree(self.project / "state", retry_state)
+        retry_candidate = self.project / "work" / "candidate-retry.rtf"
+        retry_candidate.write_text(RTF, encoding="latin-1")
+        retry_transaction = prepare_transaction(self.project, chapter, retry_candidate, retry_state)
+        retry_metadata = json.loads((retry_transaction / "transaction.json").read_text(encoding="utf-8"))
+        self.assertEqual("003", retry_transaction.name)
+        self.assertEqual(1, retry_metadata["родительская_транзакция"])
+        retry_output = commit_transaction(self.project, retry_transaction)
+        self.assertRegex(retry_output.name, r"chapter-01\.ru\.v002\.\d{8}\.rtf")
 
     def test_failed_first_state_rename_keeps_original_state(self):
         identifier, _, _ = self._publish()
@@ -252,6 +301,44 @@ class ProgressTests(unittest.TestCase):
                 commit_transaction(self.project, transaction)
         self.assertEqual(output_before, result.read_bytes())
         self.assertEqual(state_before, (self.project / "state" / "glossary.md").read_bytes())
+
+    def test_multi_file_approval_validates_every_file_before_changes(self):
+        first_id, first_result, _ = self._publish("chapter-01.rtf")
+        second_id, second_result, _ = self._publish("chapter-02.rtf")
+        self._add_published_annotation(first_id, first_result)
+        add_annotations(second_result, [{"id": "fresh-note", "точная_цитата": "First", "объяснение": "Новое замечание."}])
+        first_before = first_result.read_bytes()
+        progress_before = (self.project / "progress.json").read_bytes()
+
+        with self.assertRaisesRegex(ValueError, "новые замечания"):
+            approve_files(self.project, [first_id, second_id])
+
+        self.assertEqual(first_before, first_result.read_bytes())
+        self.assertEqual(progress_before, (self.project / "progress.json").read_bytes())
+        self.assertEqual(["known-note"], [note["id"] for note in extract_annotations(first_result)])
+
+    def test_approval_commit_failure_restores_outputs_progress_and_active_marker(self):
+        identifier, result, _ = self._publish()
+        self._add_published_annotation(identifier, result)
+        activate(self.project, {"пользовательская_верификация": "в-финале"}, [])
+        output_before = result.read_bytes()
+        progress_before = (self.project / "progress.json").read_bytes()
+        active = self.project / "work" / "active.json"
+        active_before = active.read_bytes()
+        real_copy = module._copy_atomic
+
+        def fail_progress_publish(source_path, target_path):
+            if source_path.name == "next-progress.json" and target_path == self.project / "progress.json":
+                raise OSError("progress publish failed")
+            return real_copy(source_path, target_path)
+
+        with mock.patch.object(module, "_copy_atomic", side_effect=fail_progress_publish):
+            with self.assertRaisesRegex(ValueError, "изменения отменены"):
+                approve_files(self.project, [identifier])
+
+        self.assertEqual(output_before, result.read_bytes())
+        self.assertEqual(progress_before, (self.project / "progress.json").read_bytes())
+        self.assertEqual(active_before, active.read_bytes())
 
     def test_start_over_is_confirmed_and_backed_up(self):
         _, result, _ = self._publish()
