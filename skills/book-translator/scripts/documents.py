@@ -11,7 +11,11 @@ from typing import Iterable
 
 SUPPORTED_SUFFIXES = {".rtf"}
 EXCLUDED_DIRECTORIES = {"output", "state", "work", ".codex"}
-UNSAFE_DESTINATIONS = {"field", "header", "footer", "object", "shptxt", "txbx"}
+UNSAFE_DESTINATIONS = {
+    "field", "header", "headerl", "headerr", "headerf",
+    "footer", "footerl", "footerr", "footerf",
+    "object", "shptxt", "txbx",
+}
 UNSAFE_CONTROLS = {"trowd", "cell", "row", "nesttableprops"}
 SKIPPED_DESTINATIONS = {
     "fonttbl", "colortbl", "stylesheet", "info", "pict", "object", "filetbl",
@@ -378,6 +382,17 @@ def extract_rtf(path: Path) -> dict:
     }
 
 
+def validate_publishable_rtf(path: Path) -> list[str]:
+    errors = inspect_rtf(path)
+    if errors:
+        return errors
+    forbidden = []
+    for block in extract_rtf(path)["блоки"]:
+        if "ё" in block["текст"] or "Ё" in block["текст"]:
+            forbidden.append(f"Блок {block['номер']} содержит запрещенную букву ё или Ё.")
+    return forbidden
+
+
 def split_blocks(path: Path) -> list[dict]:
     return extract_rtf(path)["блоки"]
 
@@ -477,15 +492,26 @@ def _issue_positions(raw: str, issue: dict) -> tuple[int, int]:
     occurrence = issue.get("номер_вхождения", 1)
     if not isinstance(quote, str) or not quote:
         raise ValueError("Для аннотации требуется точная цитата.")
-    plain_atoms, _ = _parse_atoms(raw, tokenize_rtf(raw))
-    plain = "".join(atom.text for atom in plain_atoms)
+    plain_atoms, blocks = _parse_atoms(raw, tokenize_rtf(raw))
+    selected_atoms = plain_atoms
+    block_number = issue.get("блок")
+    if block_number is not None:
+        try:
+            block_number = int(block_number)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Номер блока аннотации должен быть целым числом.") from error
+        if not 1 <= block_number <= len(blocks):
+            raise ValueError(f"Блок аннотации не найден: {block_number}.")
+        ranges = {tuple(value) for value in blocks[block_number - 1]["исходные_диапазоны"]}
+        selected_atoms = [atom for atom in plain_atoms if (atom.start, atom.end) in ranges]
+    plain = "".join(atom.text for atom in selected_atoms)
     try: occurrence = int(occurrence)
     except (TypeError, ValueError): occurrence = 1
     cursor = -1
     for _ in range(max(1, occurrence)):
         cursor = plain.find(quote, cursor + 1)
         if cursor < 0: raise ValueError(f"Цитата для аннотации не найдена: {quote!r}.")
-    selected = plain_atoms[cursor:cursor + len(quote)]
+    selected = selected_atoms[cursor:cursor + len(quote)]
     if not selected or "".join(atom.text for atom in selected) != quote:
         raise ValueError("Цитату нельзя однозначно привязать к RTF.")
     return selected[0].start, selected[-1].end
@@ -539,7 +565,14 @@ def file_sha256(path: Path) -> str:
 def rtf_fingerprints(path: Path) -> dict[str, str]:
     data = extract_rtf(path)
     text = "\n".join(block["текст"] for block in data["блоки"])
-    structure = json.dumps([(block["тип"], len(block["фрагменты"])) for block in data["блоки"]], ensure_ascii=False)
+    structure = json.dumps([
+        (
+            block["номер"],
+            block["тип"],
+            [(bool(fragment["полужирный"]), bool(fragment["курсив"])) for fragment in block["фрагменты"]],
+        )
+        for block in data["блоки"]
+    ], ensure_ascii=False)
     return {
         "текст": hashlib.sha256(text.encode()).hexdigest(),
         "структура": hashlib.sha256(structure.encode()).hexdigest(),

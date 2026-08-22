@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT / "skills" / "book-translator" / "scripts"))
 from documents import (
     add_annotations, annotations_only_change, extract_annotations, extract_rtf,
     inspect_rtf, rebuild_rtf, rtf_fingerprints, strip_annotations,
-    validate_translation,
+    validate_publishable_rtf, validate_translation,
 )
 
 
@@ -102,6 +102,28 @@ class RtfTests(unittest.TestCase):
         self.assertEqual([], extract_annotations(self.source))
         self.assertEqual(before["текст"], rtf_fingerprints(self.source)["текст"])
 
+    def test_annotation_quote_is_scoped_to_requested_block(self):
+        repeated = self.directory / "repeated.rtf"
+        repeated.write_text(r"{\rtf1 Same first.\par Same second.\par}", encoding="latin-1")
+        add_annotations(repeated, [{
+            "id": "second-same", "блок": 2, "точная_цитата": "Same",
+            "номер_вхождения": 1, "объяснение": "Проверить второй абзац.",
+        }])
+        raw = repeated.read_text(encoding="latin-1")
+        marker = raw.index(r"{\*\atrfstart")
+        self.assertGreater(marker, raw.index("Same"))
+        self.assertLess(marker, raw.rindex("Same"))
+        self.assertEqual("Same", extract_annotations(repeated)[0]["цитата"])
+
+    def test_structure_fingerprint_detects_formatting_change(self):
+        before = rtf_fingerprints(self.source)
+        raw = self.source.read_text(encoding="latin-1").replace(r"{\b bold}", r"{\i bold}")
+        self.source.write_text(raw, encoding="latin-1")
+        after = rtf_fingerprints(self.source)
+        self.assertEqual(before["текст"], after["текст"])
+        self.assertNotEqual(before["структура"], after["структура"])
+        self.assertFalse(annotations_only_change(before, after))
+
     def test_rejects_unsafe_text_destination_and_broken_rtf(self):
         unsafe = self.directory / "unsafe.rtf"
         unsafe.write_text(r"{\rtf1{\field hidden}}", encoding="latin-1")
@@ -110,9 +132,19 @@ class RtfTests(unittest.TestCase):
         broken.write_text(r"{\rtf1 broken", encoding="latin-1")
         self.assertTrue(inspect_rtf(broken))
 
+    def test_rejects_all_header_and_footer_variants(self):
+        for destination in ("header", "headerl", "headerr", "headerf", "footer", "footerl", "footerr", "footerf"):
+            with self.subTest(destination=destination):
+                path = self.directory / f"{destination}.rtf"
+                path.write_text(rf"{{\rtf1{{\{destination} hidden}}}}", encoding="latin-1")
+                self.assertTrue(inspect_rtf(path))
+
     def test_forbidden_letter_is_mechanical_error(self):
         errors = validate_translation([{"текст": "birch"}], [{"текст": "берёза"}])
         self.assertEqual(1, len(errors))
+        result = self.directory / "forbidden.rtf"
+        result.write_text(r"{\rtf1\ansi birch \u1105?\par}", encoding="latin-1")
+        self.assertEqual(1, len(validate_publishable_rtf(result)))
 
 
 if __name__ == "__main__":

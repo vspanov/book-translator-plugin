@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "skills" / "book-translator" / "scripts"))
 from documents import add_annotations, chapter_id, extract_annotations, file_sha256
 from progress import (
-    activate, approve_files, commit_transaction, initialize_project, load_progress,
+    activate, approve_files, commit_transaction, complete_feedback_revision, initialize_project, load_progress,
     prepare_state, prepare_transaction, register_feedback, replace_managed_contribution,
     scan_published_feedback, scan_queue,
 )
@@ -29,14 +29,22 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual([], errors)
             activate(project, {"пользовательская_верификация": "в-финале"}, queue)
 
-            def publish(source: Path, text: str, contribution: str, issue_id: str | None = None, preserve_from: Path | None = None):
+            def publish(
+                source: Path,
+                text: str,
+                contribution: str,
+                issue_id: str | None = None,
+                preserve_from: Path | None = None,
+                replace_current: bool = False,
+            ):
                 identifier = chapter_id(source)
                 progress = load_progress(project)
-                revision = int(progress["файлы"].get(identifier, {}).get("ревизия", 0)) + 1
-                prepared = project / "work" / f"prepared-{identifier}-{revision}"
+                item = progress["файлы"].get(identifier, {})
+                transaction_number = int(item.get("номер_транзакции", item.get("ревизия", 0))) + 1
+                prepared = project / "work" / f"prepared-{identifier}-{transaction_number}"
                 prepare_state(project, identifier, prepared)
                 replace_managed_contribution(prepared, identifier, {"glossary.md": contribution})
-                candidate = project / "work" / f"candidate-{identifier}-{revision}.rtf"
+                candidate = project / "work" / f"candidate-{identifier}-{transaction_number}.rtf"
                 if preserve_from is None:
                     candidate.write_text(r"{\rtf1\ansi " + text + r"\par}", encoding="latin-1")
                 else:
@@ -46,7 +54,10 @@ class EndToEndTests(unittest.TestCase):
                     issue = {"id": issue_id, "точная_цитата": text.split()[0], "объяснение": "Проверить оттенок."}
                     add_annotations(candidate, [issue]); reports = [{"замечания": [issue]}]
                 chapter = {"id": identifier, "имя": source.name, "sha256": file_sha256(source)}
-                return identifier, commit_transaction(project, prepare_transaction(project, chapter, candidate, prepared, reports))
+                transaction = prepare_transaction(
+                    project, chapter, candidate, prepared, reports, replace_current=replace_current,
+                )
+                return identifier, commit_transaction(project, transaction)
 
             first_id, first_output = publish(first, "First translation.", "Термин первой сцены.", "agent-1")
             second_id, second_output = publish(second, "Second translation.", "Термин второй сцены.")
@@ -58,10 +69,14 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual([], errors)
             self.assertEqual(["user-1"], [item["id"] for item in feedback[first_id]])
             register_feedback(project, first_id, ["user-1"])
-            first_id, revised = publish(first, "First revision.", "Уточненный термин первой сцены.", preserve_from=first_output)
-            self.assertRegex(revised.name, r"\.v002\.\d{8}\.rtf$")
+            first_id, revised = publish(
+                first, "First revision.", "Уточненный термин первой сцены.",
+                preserve_from=first_output, replace_current=True,
+            )
+            self.assertEqual(first_output, revised)
             self.assertEqual({"agent-1", "user-1"}, {item["id"] for item in extract_annotations(revised)})
             self.assertEqual(second_hash, file_sha256(second_output))
+            complete_feedback_revision(project, first_id)
             approve_files(project, [first_id, second_id])
             self.assertEqual([], extract_annotations(revised))
 
@@ -79,7 +94,7 @@ class EndToEndTests(unittest.TestCase):
             before_second_state = (project / "state" / "glossary.md").read_text(encoding="utf-8")
             activate(project, {"пользовательская_верификация": "в-финале"}, [{"id": first_id}])
             _, third = publish(first, "Fresh translation.", "Новый вклад первой сцены.")
-            self.assertRegex(third.name, r"\.v003\.\d{8}\.rtf$")
+            self.assertRegex(third.name, r"\.v002\.\d{8}\.rtf$")
             self.assertEqual(second_hash, file_sha256(second_output))
             after_state = (project / "state" / "glossary.md").read_text(encoding="utf-8")
             self.assertIn("Термин второй сцены.", before_second_state)

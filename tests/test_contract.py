@@ -104,6 +104,9 @@ class ContractTests(unittest.TestCase):
             self.assertIn(phrase, principles)
         self.assertIn("Add to chat", skill)
         self.assertIn("кликабельную абсолютную ссылку", skill)
+        self.assertIn("### Редактор пользовательской доработки N", skill)
+        self.assertIn("Повторяй этот цикл с новым editor", skill)
+        self.assertIn("не ограничивает пользовательские доработки", skill)
 
     def test_detailed_coordinator_workflow_is_preserved(self):
         skill = (ROOT / "skills" / "book-translator" / "SKILL.md").read_text(encoding="utf-8").casefold()
@@ -184,6 +187,7 @@ class ContractTests(unittest.TestCase):
             "максимум_циклов = 5",
             "пользовательская_верификация = в_финале",
             "add to chat",
+            "замечания → редактор → обновленный файл → приемка",
             "пользовательский глоссарий имеет абсолютный приоритет",
         ):
             self.assertIn(phrase, readme)

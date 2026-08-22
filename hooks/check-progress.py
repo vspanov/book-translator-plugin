@@ -10,7 +10,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 PLUGIN_ROOT = Path(os.environ.get("PLUGIN_ROOT", Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(PLUGIN_ROOT / "skills" / "book-translator" / "scripts"))
-from progress import check_consistency, has_project_identity, is_unsafe_link
+from progress import PROJECT_MARKER_NAME, check_consistency, has_project_identity, is_unsafe_link
 
 
 ALLOW = {"continue": True, "suppressOutput": True}
@@ -22,6 +22,15 @@ def block(reason: str) -> dict:
 
 def find_project(start: Path) -> Path | None:
     for candidate in (start.resolve(), *start.resolve().parents):
+        identity = candidate / PROJECT_MARKER_NAME
+        if is_unsafe_link(identity) or not identity.is_file():
+            continue
+        try:
+            marker = json.loads(identity.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not has_project_identity(marker):
+            continue
         active = candidate / "work" / "active.json"
         if active.is_file() or is_unsafe_link(active): return candidate
     return None
@@ -54,6 +63,10 @@ def evaluate(event: dict) -> dict:
 
 
 def main() -> None:
+    for stream in (sys.stdin, sys.stdout):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8")
     try: event = json.load(sys.stdin)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError): event = {}
     json.dump(evaluate(event if isinstance(event, dict) else {}), sys.stdout, ensure_ascii=False)

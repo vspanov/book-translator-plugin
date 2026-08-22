@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +19,7 @@ STATE_FILES = (
 )
 VALID_MODES = {"продолжить", "начать-заново", "перевести-заново"}
 VALID_REVIEW_MODES = {"после-каждого-файла", "в-финале"}
+REPARSE_POINT_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 
 def _json_atomic(path: Path, value: dict) -> None:
@@ -63,7 +65,32 @@ def has_project_identity(value: object) -> bool:
 
 
 def is_unsafe_link(path: Path) -> bool:
-    return path.is_symlink()
+    try:
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except OSError:
+        attributes = 0
+    return path.is_symlink() or bool(attributes & REPARSE_POINT_ATTRIBUTE)
+
+
+def _find_unsafe_link(root: Path) -> Path | None:
+    if is_unsafe_link(root):
+        return root
+    if not root.exists() or not root.is_dir():
+        return None
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError as error:
+            raise ValueError(f"Не удалось безопасно проверить {current}.") from error
+        for entry in entries:
+            path = Path(entry.path)
+            if is_unsafe_link(path):
+                return path
+            if entry.is_dir(follow_symlinks=False):
+                pending.append(path)
+    return None
 
 
 def ensure_project(project_dir: Path) -> dict:
@@ -80,7 +107,13 @@ def ensure_project(project_dir: Path) -> dict:
 def install_agents(project_dir: Path, overwrite: set[str] | None = None) -> list[str]:
     overwrite = overwrite or set()
     source_dir = _asset_root() / "agents"
-    target_dir = project_dir / ".codex" / "agents"
+    codex_dir = project_dir / ".codex"
+    if codex_dir.exists() and (not codex_dir.is_dir() or is_unsafe_link(codex_dir)):
+        raise ValueError("Путь .codex/ небезопасен.")
+    codex_dir.mkdir(exist_ok=True)
+    target_dir = codex_dir / "agents"
+    if target_dir.exists() and (not target_dir.is_dir() or is_unsafe_link(target_dir)):
+        raise ValueError("Путь .codex/agents/ небезопасен.")
     target_dir.mkdir(parents=True, exist_ok=True)
     conflicts: list[str] = []
     for source in sorted(source_dir.glob("*.toml")):
@@ -109,7 +142,7 @@ def initialize_project(project_dir: Path, overwrite_agents: set[str] | None = No
         _json_atomic(marker_path, marker)
     for name in ("input", "output", "state", "work"):
         target = project_dir / name
-        if target.exists() and (not target.is_dir() or target.is_symlink()):
+        if target.exists() and (not target.is_dir() or is_unsafe_link(target)):
             raise ValueError(f"Путь {name}/ небезопасен.")
         target.mkdir(exist_ok=True)
     assets = _asset_root()
@@ -170,6 +203,7 @@ def load_config(project_dir: Path, overrides: dict | None = None) -> dict:
         "пользовательская_верификация": section.get("пользовательская_верификация", "в_финале").strip(),
     }
     config.update({key: value for key, value in (overrides or {}).items() if value is not None})
+    config["пользовательская_верификация"] = _normalize_review_mode(config["пользовательская_верификация"])
     if config["режим"] not in VALID_MODES: raise ValueError("Неизвестный режим перевода.")
     if type(config["максимум_циклов"]) is not int or not 1 <= config["максимум_циклов"] <= 20:
         raise ValueError("максимум_циклов должен быть целым числом от 1 до 20.")
@@ -187,12 +221,16 @@ def parse_request_arguments(arguments: list[str]) -> dict:
             if not re.fullmatch(r"\d+", value): raise ValueError("циклы должны быть целым числом от 1 до 20.")
             result["максимум_циклов"] = int(value)
         elif argument.startswith("верификация="):
-            result["пользовательская_верификация"] = argument.split("=", 1)[1]
+            result["пользовательская_верификация"] = _normalize_review_mode(argument.split("=", 1)[1])
     if "максимум_циклов" in result and not 1 <= result["максимум_циклов"] <= 20:
         raise ValueError("циклы должны быть целым числом от 1 до 20.")
     if result.get("пользовательская_верификация", "в-финале") not in VALID_REVIEW_MODES:
         raise ValueError("Неизвестный режим пользовательской верификации.")
     return result
+
+
+def _normalize_review_mode(value: object) -> object:
+    return value.strip().replace("_", "-") if isinstance(value, str) else value
 
 
 def verification_schedule(maximum: int) -> list[dict]:
@@ -274,23 +312,37 @@ def _revision_dir(project_dir: Path, chapter_identifier: str, revision: int) -> 
     return project_dir / "work" / "revisions" / chapter_identifier / f"{revision:03d}"
 
 
+def _next_transaction_number(project_dir: Path, chapter_identifier: str) -> int:
+    root = project_dir / "work" / "revisions" / chapter_identifier
+    numbers = [int(path.name) for path in root.iterdir() if path.is_dir() and path.name.isdigit()] if root.is_dir() else []
+    return max(numbers, default=0) + 1
+
+
 def prepare_transaction(
     project_dir: Path,
     chapter: dict,
     candidate: Path,
     prepared_state: Path,
     reports: list[dict] | None = None,
+    replace_current: bool = False,
 ) -> Path:
     ensure_project(project_dir)
-    from documents import inspect_rtf
+    from documents import inspect_rtf, validate_publishable_rtf
     mechanical_errors = inspect_rtf(candidate)
+    mechanical_errors.extend(validate_publishable_rtf(candidate) if not mechanical_errors else [])
     if mechanical_errors:
         raise ValueError("Кандидат не прошел механическую проверку: " + " ".join(mechanical_errors))
     progress = load_progress(project_dir)
     identifier = chapter["id"]
     previous = progress["файлы"].get(identifier, {})
-    revision = int(previous.get("ревизия", 0)) + 1
-    revision_dir = _revision_dir(project_dir, identifier, revision)
+    previous_output = previous.get("последний_результат")
+    if replace_current and not isinstance(previous_output, str):
+        raise ValueError("Текущий опубликованный результат для пользовательской доработки не найден.")
+    if replace_current and not previous.get("ожидающие_аннотации"):
+        raise ValueError("Заменять текущий RTF без новой версии можно только в активном цикле пользовательской доработки.")
+    result_revision = int(previous.get("ревизия", 0)) + (0 if replace_current else 1)
+    transaction_number = _next_transaction_number(project_dir, identifier)
+    revision_dir = _revision_dir(project_dir, identifier, transaction_number)
     if revision_dir.exists(): raise ValueError("Каталог этой ревизии уже существует.")
     revision_dir.mkdir(parents=True)
     backup = revision_dir / "backup"; backup.mkdir()
@@ -300,7 +352,6 @@ def prepare_transaction(
     shutil.copytree(project_dir / "state", backup / "state")
     if file_sha256(backup / "progress.json") != progress_hash or directory_sha256(backup / "state") != state_hash:
         raise ValueError("Не удалось проверить резервную копию progress или state.")
-    previous_output = previous.get("последний_результат")
     previous_output_hash = None
     if isinstance(previous_output, str) and (project_dir / "output" / previous_output).is_file():
         previous_output_hash = file_sha256(project_dir / "output" / previous_output)
@@ -308,8 +359,8 @@ def prepare_transaction(
         if file_sha256(backup / previous_output) != previous_output_hash:
             raise ValueError("Не удалось проверить резервную копию прежнего перевода.")
     previous_revision_hash = None
-    if revision > 1:
-        previous_revision = _revision_dir(project_dir, identifier, revision - 1)
+    if transaction_number > 1:
+        previous_revision = _revision_dir(project_dir, identifier, transaction_number - 1)
         if not (previous_revision / "завершено").is_file():
             raise ValueError("Артефакты предыдущей ревизии не подтверждены.")
         previous_revision_hash = directory_sha256(previous_revision)
@@ -318,8 +369,9 @@ def prepare_transaction(
     if reports is not None: _json_atomic(revision_dir / "verification-reports.json", {"раунды": reports})
     metadata = {
         "схема": SCHEMA_VERSION, "id_файла": identifier, "исходник": chapter["имя"],
-        "sha256_исходника": chapter["sha256"], "ревизия": revision,
-        "имя_результата": output_name(chapter["имя"], revision),
+        "sha256_исходника": chapter["sha256"], "ревизия": result_revision,
+        "номер_транзакции": transaction_number, "замена_текущего": replace_current,
+        "имя_результата": previous_output if replace_current else output_name(chapter["имя"], result_revision),
         "sha256_кандидата": file_sha256(staged), "sha256_state": directory_sha256(revision_dir / "prepared-state"),
         "резервная_копия": {"sha256_progress": progress_hash, "sha256_state": state_hash, "предыдущий_результат": previous_output, "sha256_предыдущего_результата": previous_output_hash, "sha256_предыдущей_ревизии": previous_revision_hash},
     }
@@ -340,30 +392,50 @@ def _restore_backup(project_dir: Path, revision_dir: Path) -> None:
     _copy_atomic(backup / "progress.json", project_dir / "progress.json")
 
 
+def _replace_path(source: Path, target: Path) -> None:
+    source.replace(target)
+
+
 def commit_transaction(project_dir: Path, revision_dir: Path) -> Path:
-    from documents import extract_annotations, inspect_rtf, rtf_fingerprints
+    from documents import extract_annotations, inspect_rtf, rtf_fingerprints, validate_publishable_rtf
     metadata = json.loads((revision_dir / "transaction.json").read_text(encoding="utf-8"))
     candidate = revision_dir / "candidate.rtf"; staged_state = revision_dir / "prepared-state"
     if file_sha256(candidate) != metadata["sha256_кандидата"] or directory_sha256(staged_state) != metadata["sha256_state"]:
         raise ValueError("Кандидат или подготовленный state изменились после проверки.")
     errors = inspect_rtf(candidate)
+    errors.extend(validate_publishable_rtf(candidate) if not errors else [])
     if errors: raise ValueError("Собранный RTF поврежден: " + " ".join(errors))
     output = project_dir / "output" / metadata["имя_результата"]
-    if output.exists(): raise ValueError("Имя новой ревизии уже занято.")
+    replace_current = bool(metadata.get("замена_текущего"))
+    if replace_current:
+        expected = metadata["резервная_копия"].get("sha256_предыдущего_результата")
+        if not output.is_file() or not expected or file_sha256(output) != expected:
+            raise ValueError("Опубликованный RTF изменился после подготовки пользовательской доработки.")
+    elif output.exists():
+        raise ValueError("Имя новой ревизии уже занято.")
     state_swap = revision_dir / "state-to-publish"; shutil.copytree(staged_state, state_swap)
     old_state = project_dir / "state"; archived_state = revision_dir / "published-state-backup"
+    state_archived = False
+    state_published = False
+    output_published = False
     try:
-        old_state.replace(archived_state)
-        state_swap.replace(old_state)
+        _replace_path(old_state, archived_state)
+        state_archived = True
+        _replace_path(state_swap, old_state)
+        state_published = True
         _copy_atomic(candidate, output)
+        output_published = True
         progress = load_progress(project_dir)
         item = progress["файлы"].setdefault(metadata["id_файла"], {})
         old_result = item.get("последний_результат")
         history = item.setdefault("история_результатов", [])
-        if old_result and old_result not in history: history.append(old_result)
+        if old_result and old_result != metadata["имя_результата"] and old_result not in history:
+            history.append(old_result)
         item.update({
             "имя": metadata["исходник"], "sha256_исходника": metadata["sha256_исходника"],
             "ревизия": metadata["ревизия"], "последний_результат": metadata["имя_результата"],
+            "номер_транзакции": metadata.get("номер_транзакции", metadata["ревизия"]),
+            "тип_публикации": "пользовательская-доработка" if replace_current else "новая-версия",
             "sha256_результата": file_sha256(output), "статус": "ожидает-одобрения",
             "отпечатки_при_публикации": rtf_fingerprints(output),
             "аннотации_при_публикации": [note["id"] for note in extract_annotations(output)],
@@ -381,16 +453,24 @@ def commit_transaction(project_dir: Path, revision_dir: Path) -> Path:
         (revision_dir / "завершено").write_text("да\n", encoding="utf-8")
         return output
     except Exception as error:
-        output.unlink(missing_ok=True)
-        if old_state.exists(): shutil.rmtree(old_state)
-        if archived_state.exists(): archived_state.replace(old_state)
+        if output_published and replace_current:
+            backup_output = revision_dir / "backup" / metadata["имя_результата"]
+            if backup_output.is_file():
+                _copy_atomic(backup_output, output)
+        elif not replace_current:
+            output.unlink(missing_ok=True)
+        if state_archived:
+            if state_published and old_state.exists():
+                shutil.rmtree(old_state)
+            if archived_state.exists():
+                _replace_path(archived_state, old_state)
         _copy_atomic(revision_dir / "backup" / "progress.json", project_dir / "progress.json")
         (revision_dir / "откачено").write_text(str(error), encoding="utf-8")
         raise ValueError(f"Публикация не удалась; предыдущий перевод и state восстановлены: {error}") from error
 
 
 def approve_files(project_dir: Path, identifiers: list[str], strip_callback=None) -> dict:
-    from documents import annotations_only_change, rtf_fingerprints
+    from documents import annotations_only_change, extract_annotations, rtf_fingerprints
     if strip_callback is None:
         from documents import strip_annotations
         strip_callback = strip_annotations
@@ -402,6 +482,13 @@ def approve_files(project_dir: Path, identifiers: list[str], strip_callback=None
         current = rtf_fingerprints(result)
         if not annotations_only_change(item.get("отпечатки_при_публикации", {}), current):
             raise ValueError(f"Основной текст или структура «{result.name}» изменены напрямую.")
+        pending = item.get("ожидающие_аннотации", [])
+        if pending:
+            raise ValueError(f"Файл «{result.name}» еще ожидает редакторской обработки замечаний.")
+        known = set(item.get("аннотации_при_публикации", [])) | set(item.get("обработанные_аннотации", []))
+        fresh = [note["id"] for note in extract_annotations(result) if note["id"] not in known]
+        if fresh:
+            raise ValueError(f"В файле «{result.name}» есть новые замечания; сначала отправьте его на доработку.")
         strip_callback(result)
         item["sha256_результата"] = file_sha256(result)
         item["отпечатки_при_публикации"] = rtf_fingerprints(result)
@@ -422,12 +509,81 @@ def register_feedback(project_dir: Path, identifier: str, annotation_ids: list[s
     item = progress["файлы"].get(identifier)
     if not item: raise ValueError("Файл для обратной связи не найден.")
     handled = set(item.setdefault("обработанные_аннотации", []))
-    fresh = [value for value in annotation_ids if value not in handled]
-    item["обработанные_аннотации"].extend(fresh)
+    pending = item.setdefault("ожидающие_аннотации", [])
+    known = handled | set(pending)
+    fresh = [value for value in annotation_ids if value not in known]
+    if not fresh:
+        return []
+    pending.extend(fresh)
+    cycles = item.setdefault("циклы_пользовательской_доработки", [])
+    cycles.append({
+        "номер": len(cycles) + 1,
+        "аннотации": list(fresh),
+        "исходная_транзакция": int(item.get("номер_транзакции", item.get("ревизия", 0))),
+        "статус": "ожидает-редактора",
+    })
     item["статус"] = "на-доработке"
-    progress.update({"статус_книги": "в-работе", "этап": "учет-замечаний", "текущий_файл": item["имя"]})
+    progress.update({"статус_книги": "в-работе", "этап": "пользовательская-редактура", "текущий_файл": item["имя"]})
     save_progress(project_dir, progress)
     return fresh
+
+
+def complete_feedback_revision(project_dir: Path, identifier: str, annotation_ids: list[str] | None = None) -> dict:
+    progress = load_progress(project_dir)
+    item = progress["файлы"].get(identifier)
+    if not item:
+        raise ValueError("Файл для завершения пользовательской доработки не найден.")
+    pending = list(item.get("ожидающие_аннотации", []))
+    selected = pending if annotation_ids is None else list(annotation_ids)
+    if not pending or set(selected) != set(pending):
+        raise ValueError("Завершение должно подтвердить все замечания текущего пользовательского цикла.")
+    cycle = next(
+        (value for value in reversed(item.get("циклы_пользовательской_доработки", [])) if value.get("статус") == "ожидает-редактора"),
+        None,
+    )
+    if (
+        cycle is None
+        or item.get("тип_публикации") != "пользовательская-доработка"
+        or int(item.get("номер_транзакции", 0)) <= int(cycle.get("исходная_транзакция", 0))
+    ):
+        raise ValueError("Сначала атомарно обновите текущий проверенный результат после работы редактора.")
+    handled = item.setdefault("обработанные_аннотации", [])
+    handled.extend(value for value in pending if value not in handled)
+    item["ожидающие_аннотации"] = []
+    cycle["статус"] = "исправлено-ожидает-одобрения"
+    cycle["ревизия"] = item.get("ревизия")
+    cycle["транзакция"] = item.get("номер_транзакции")
+    item["статус"] = "ожидает-одобрения"
+    if identifier not in progress["ожидают_одобрения"]:
+        progress["ожидают_одобрения"].append(identifier)
+    progress.update({
+        "статус_книги": "ожидает-одобрения",
+        "этап": "пользовательская-верификация",
+        "текущий_файл": item.get("имя"),
+        "ошибка": None,
+    })
+    save_progress(project_dir, progress)
+    return progress
+
+
+def release_feedback_revision(project_dir: Path, identifier: str) -> dict:
+    progress = load_progress(project_dir)
+    item = progress["файлы"].get(identifier)
+    if not item:
+        raise ValueError("Файл для отмены пользовательской доработки не найден.")
+    item["ожидающие_аннотации"] = []
+    for cycle in reversed(item.get("циклы_пользовательской_доработки", [])):
+        if cycle.get("статус") == "ожидает-редактора":
+            cycle["статус"] = "не-выполнено"
+            break
+    item["статус"] = "ожидает-одобрения"
+    progress.update({
+        "статус_книги": "ожидает-одобрения",
+        "этап": "пользовательская-верификация",
+        "текущий_файл": item.get("имя"),
+    })
+    save_progress(project_dir, progress)
+    return progress
 
 
 def scan_published_feedback(project_dir: Path, only_identifier: str | None = None) -> tuple[dict[str, list[dict]], list[str]]:
@@ -446,7 +602,11 @@ def scan_published_feedback(project_dir: Path, only_identifier: str | None = Non
         if not annotations_only_change(baseline, current):
             errors.append(f"Основной текст или структура «{name}» изменены напрямую.")
             continue
-        ignored = set(item.get("аннотации_при_публикации", [])) | set(item.get("обработанные_аннотации", []))
+        ignored = (
+            set(item.get("аннотации_при_публикации", []))
+            | set(item.get("обработанные_аннотации", []))
+            | set(item.get("ожидающие_аннотации", []))
+        )
         fresh = [note for note in extract_annotations(path) if note["id"] not in ignored]
         if fresh: feedback[identifier] = fresh
     return feedback, errors
@@ -521,8 +681,9 @@ def restart_project(project_dir: Path, confirmed: bool = False) -> list[Path] | 
     affected = [project_dir / "output", project_dir / "state", project_dir / "progress.json", project_dir / "work"]
     if not confirmed: return affected
     for root in affected:
-        candidates = [root, *(root.rglob("*") if root.is_dir() else [])]
-        if any(path.is_symlink() for path in candidates): raise ValueError(f"Нельзя безопасно очистить {root.name}: найден символический путь.")
+        unsafe = _find_unsafe_link(root)
+        if unsafe is not None:
+            raise ValueError(f"Нельзя безопасно очистить {root.name}: найден символический путь или reparse point «{unsafe.name}».")
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     backup = project_dir / "work" / "restarts" / timestamp
     backup.mkdir(parents=True)
