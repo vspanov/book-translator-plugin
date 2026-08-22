@@ -1,6 +1,6 @@
 name = "book_translator_editor"
 description = "Исправляет только подтвержденные замечания в переводе."
-model = "gpt-5.6-sol"
+model = "gpt-5.6-terra"
 model_reasoning_effort = "high"
 sandbox_mode = "workspace-write"
 developer_instructions = """
